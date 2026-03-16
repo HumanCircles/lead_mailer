@@ -1,7 +1,9 @@
+import json as _json
 import os
 from typing import Dict, Any, List
 
 import streamlit as st
+import streamlit.components.v1 as components
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -136,6 +138,42 @@ def run_campaign_ui(fresh_data: bool):
                 st.markdown("**Subject:** " + preview["subject"])
                 st.markdown("**Body:**")
                 st.text(preview["body"])
+                draft_text = f"Subject: {preview['subject']}\n\n{preview['body']}"
+                # Copy-to-clipboard button (browser only)
+                copy_js = f"""
+                <button id="copyBtn" style="
+                    padding: 0.35rem 0.75rem;
+                    margin-right: 0.5rem;
+                    margin-bottom: 0.5rem;
+                    cursor: pointer;
+                    border: 1px solid #ccc;
+                    border-radius: 4px;
+                    background: #f0f2f6;
+                    font-size: 14px;
+                ">Copy draft</button>
+                <span id="copyMsg" style="font-size: 12px; color: #0e8c80;"></span>
+                <script>
+                (function() {{
+                    var btn = document.getElementById("copyBtn");
+                    var msg = document.getElementById("copyMsg");
+                    var text = {_json.dumps(draft_text)};
+                    btn.onclick = function() {{
+                        navigator.clipboard.writeText(text).then(function() {{
+                            msg.textContent = "Copied!";
+                            setTimeout(function() {{ msg.textContent = ""; }}, 2000);
+                        }});
+                    }};
+                }})();
+                </script>
+                """
+                components.html(copy_js, height=45)
+                st.download_button(
+                    "Download draft",
+                    data=draft_text,
+                    file_name="draft_email.txt",
+                    mime="text/plain",
+                    key=f"copy_draft_{idx}",
+                )
 
 
 def main():
