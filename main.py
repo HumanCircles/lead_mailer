@@ -1,8 +1,11 @@
 import os
 import time, sys
+from dotenv import load_dotenv
 from rich.console import Console
 from rich.table import Table
 from tenacity import retry, stop_after_attempt, wait_exponential
+
+load_dotenv()
 
 from core.sheets_reader   import get_leads, mark_sent
 from core.linkedin_scraper import scrape_linkedin
@@ -12,10 +15,10 @@ from core.gmail_sender    import send_email
 console = Console()
 
 DELAY_BETWEEN_EMAILS = 5  # seconds — avoid Gmail rate limits
-ENRICHLAYER_FRESH_DATA = os.getenv("ENRICHLAYER_FRESH_DATA", "true").lower() == "true"
+
 
 @retry(stop=stop_after_attempt(3), wait=wait_exponential(multiplier=2, min=4, max=20))
-def process_lead(lead: dict):
+def process_lead(lead: dict, fresh_data: bool):
     name         = lead["name"]
     email        = lead["email"]
     linkedin_url = lead["linkedin_url"]
@@ -25,9 +28,9 @@ def process_lead(lead: dict):
     # Step 1: Scrape LinkedIn
     console.print(
         f"  [yellow]→[/yellow] Scraping LinkedIn profile "
-        f"(fresh_data={'ON' if ENRICHLAYER_FRESH_DATA else 'OFF'})..."
+        f"(fresh_data={'ON' if fresh_data else 'OFF'})..."
     )
-    profile = scrape_linkedin(linkedin_url, fresh=ENRICHLAYER_FRESH_DATA)
+    profile = scrape_linkedin(linkedin_url, fresh=fresh_data)
     console.print(f"  [green]✓[/green] Got profile: {profile.get('headline', 'N/A')}")
 
     # Step 2: Draft email with Gemini
@@ -44,6 +47,8 @@ def process_lead(lead: dict):
 
 
 def main():
+    fresh_data = os.getenv("ENRICHLAYER_FRESH_DATA", "true").lower() == "true"
+
     console.print("[bold magenta]HireQuotient — Personalized Lead Mailer[/bold magenta]")
     console.print("[dim]Reading leads from Google Sheet...[/dim]\n")
 
@@ -53,7 +58,7 @@ def main():
     results = []
     for lead in leads:
         try:
-            email_content = process_lead(lead)
+            email_content = process_lead(lead, fresh_data)
             mark_sent(lead["row_index"])
             results.append({"name": lead["name"], "status": "✅ SENT", 
                             "subject": email_content["subject"]})

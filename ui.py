@@ -4,6 +4,8 @@ from typing import Dict, Any, List
 import streamlit as st
 from dotenv import load_dotenv
 
+load_dotenv()
+
 from core.sheets_reader import get_leads, mark_sent
 from core.linkedin_scraper import scrape_linkedin
 from core.email_drafter import draft_email
@@ -92,39 +94,45 @@ def run_campaign_ui(fresh_data: bool):
             with col1:
                 if st.button("Preview email", key=f"preview_{idx}"):
                     try:
-                        profile = scrape_linkedin(
-                            lead["linkedin_url"],
-                            fresh=fresh_data,
-                        )
-                        email_content = draft_email(lead, profile)
-                        st.session_state[f"preview_{idx}"] = email_content
+                        with st.spinner("Drafting email..."):
+                            profile = scrape_linkedin(
+                                lead["linkedin_url"],
+                                fresh=fresh_data,
+                            )
+                            email_content = draft_email(lead, profile)
+                            if isinstance(email_content, dict):
+                                st.session_state[f"email_preview__{idx}"] = email_content
+                        st.rerun()
                     except Exception as e:
                         st.error(f"Failed to draft email: {e}")
 
             with col2:
                 if st.button("Send email", key=f"send_{idx}"):
                     try:
-                        # Use existing preview if available, otherwise draft on the fly
-                        email_content = st.session_state.get(f"preview_{idx}")
-                        if email_content is None:
-                            profile = scrape_linkedin(
-                                lead["linkedin_url"],
-                                fresh=fresh_data,
-                            )
-                            email_content = draft_email(lead, profile)
-
-                        msg_id = send_email(
-                            lead["email"],
-                            email_content["subject"],
-                            email_content["body"],
-                        )
-                        mark_sent(lead["row_index"])
-                        st.success(f"Email sent (Gmail ID: {msg_id}). Marked as SENT in sheet.")
+                        # Use existing preview if available and valid, otherwise draft on the fly
+                        email_content = st.session_state.get(f"email_preview__{idx}")
+                        if not isinstance(email_content, dict):
+                            with st.spinner("Drafting and sending..."):
+                                profile = scrape_linkedin(
+                                    lead["linkedin_url"],
+                                    fresh=fresh_data,
+                                )
+                                email_content = draft_email(lead, profile)
+                        if isinstance(email_content, dict):
+                            with st.spinner("Sending..."):
+                                msg_id = send_email(
+                                    lead["email"],
+                                    email_content["subject"],
+                                    email_content["body"],
+                                )
+                                mark_sent(lead["row_index"])
+                            st.success(f"Email sent (Gmail ID: {msg_id}). Marked as SENT in sheet.")
+                        st.rerun()
                     except Exception as e:
                         st.error(f"Failed to send email: {e}")
 
-            preview = st.session_state.get(f"preview_{idx}")
-            if preview:
+            preview = st.session_state.get(f"email_preview__{idx}")
+            if isinstance(preview, dict):
                 st.markdown("**Subject:** " + preview["subject"])
                 st.markdown("**Body:**")
                 st.text(preview["body"])
