@@ -1,0 +1,14 @@
+# Gemini API
+GEMINI_API_KEY=your_gemini_api_key_here
+
+# EnrichLayer (LinkedIn profile API) — https://enrichlayer.com
+ENRICHLAYER_API_KEY=4wXoiJiHFUePyXsxW36tOQ
+ENRICHLAYER_FRESH_DATA=true
+
+# Gmail sender address
+SENDER_EMAIL=your.email@gmail.com
+
+# Path to service account JSON for Sheets, and OAuth2 credentials for Gmail
+GOOGLE_SERVICE_ACCOUNT_JSON=service_account.json
+GMAIL_OAUTH_CREDENTIALS=gmail_credentials.json
+GMAIL_TOKEN_FILE=gmail_token.json
