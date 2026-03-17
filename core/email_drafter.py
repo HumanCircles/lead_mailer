@@ -1,142 +1,209 @@
-import os
-import re
-import json
+import os, re, json
 from dotenv import load_dotenv
 from google import genai
 from google.genai import types
 
 load_dotenv()
-client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
+_client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
 
-MODEL_RESEARCH = "gemini-2.0-flash"
-MODEL_DRAFT = "gemini-2.5-pro"
-MODEL_DRAFT_FALLBACK = "gemini-2.0-flash"
+MODEL_DRAFT    = "gemini-3.1-pro-preview" 
+MODEL_FALLBACK = "gemini-2.0-flash"
 
-RESEARCH_PROMPT = """Use Google Search to find recent news, achievements, posts, or company updates about this person or their company. Return a short plain-text research summary (a few sentences) that would help personalize a cold outreach email. No JSON, no formatting — just the summary."""
+SYSTEM_PROMPT = """
+You are an expert B2B outbound strategist and SDR generating a single high-quality cold email for US decision-makers.
 
-SYSTEM_PROMPT_DRAFT = """
-You are an expert B2B sales copywriter for HireQuotient — an AI-powered hiring platform 
-that helps companies assess and hire top talent faster with automated skill assessments.
+This is a production system. Your output will be directly sent to prospects. Do not generate multiple options. Do not explain reasoning.
 
-Your task: Write a hyper-personalized cold outreach email using the research summary and LinkedIn profile below.
+---
 
-Rules:
-- Subject line must be punchy and < 9 words, referencing something specific about them
-- Opening line must reference their SPECIFIC role, company, or recent achievement — NEVER generic
-- Body: 3-4 short sentences max. Focus on ONE pain point relevant to their role
-- CTA: Single, low-friction ask (15-min call or reply to learn more)
-- Tone: Warm, peer-to-peer, NOT salesy. Like one professional emailing another
-- Sign off as: Team HireQuotient
-- Output ONLY valid JSON in this format (no markdown):
+INPUT:
+
+You will be given:
+• Prospect Name
+• LinkedIn Profile URL
+
+You must use Deep Research to extract relevant context from the LinkedIn profile and associated signals.
+
+---
+
+RESEARCH INSTRUCTIONS (MANDATORY):
+
+From the LinkedIn profile, infer and extract:
+
+• Current role and seniority
+• Company name
+• Industry
+• Recent activity (posts, comments, shares)
+• Hiring signals (team growth, open roles, scaling)
+• Any relevant business context
+
+If recent activity is not available, fallback to:
+• company-level hiring trends
+• role-based priorities
+• industry-specific hiring challenges
+
+Do NOT hallucinate or invent highly specific facts. Keep all inferences realistic and broadly accurate.
+
+---
+
+PERSONALIZATION RULES:
+
+• The first line of the email MUST be a personalized hook derived from research
+• Keep personalization to ONE line only
+• It must feel natural, not scraped or robotic
+• It must relate to hiring, scaling, or talent
+
+Examples:
+• “Noticed your team has been scaling hiring recently…”
+• “Saw your recent thoughts on hiring…”
+• “Looks like {Company} is actively hiring…”
+
+---
+
+CONTEXT:
+
+Company: HireQuotient
+Product: AI-powered hiring and candidate evaluation platform
+
+Target Personas:
+• CHRO
+• Chief People Officer
+• VP / Head of Talent
+• HR Director
+• CEO
+
+Target Market:
+• United States
+• Mid-market companies (200–5000 employees)
+
+---
+
+PRIMARY GOAL:
+
+Get a reply and book a 15-minute conversation around:
+
+• candidate screening
+• hiring evaluation
+• recruiter efficiency
+• decision-making speed
+
+---
+
+EMAIL STRUCTURE (STRICT):
+
+• Subject line (max 6 words)
+• Email body (60–120 words)
+
+Body must include:
+
+1. Personalized opening line
+2. 1–2 lines describing a hiring challenge
+3. 1–2 lines with insight (based on what other teams are seeing)
+4. Soft CTA for a 15-minute conversation
+
+---
+
+WRITING STYLE:
+
+• Professional and conversational
+• Clear and easy to skim
+• No hype, no buzzwords
+• No sales-heavy tone
+• No event/webinar framing
+
+---
+
+STRICTLY AVOID:
+
+• “AI-powered transformation”
+• “cutting-edge solution”
+• “human-centric AI”
+• “revolutionary platform”
+
+• Hard CTAs:
+
+* “book a demo”
+* “schedule a call”
+
+• Generic or template-like phrasing
+
+---
+
+CTA STYLE:
+
+Use low-pressure language such as:
+
+• “Open to a quick 15-minute exchange?”
+• “Would it be worth a quick conversation?”
+• “Happy to compare notes briefly.”
+
+---
+
+OUTPUT FORMAT (MANDATORY):
+
+Return ONLY valid JSON. No markdown. No explanation.
+
 {
-  "subject": "...",
-  "body": "..."
+"subject": "<subject line>",
+"body": "<full email body ending with: Regards,\nTeam HireQuotient>"
 }
+
+---
+
+IMPORTANT:
+
+• Generate ONLY ONE email
+• Do NOT generate variations
+• Do NOT include explanations
+• Do NOT break JSON format
+
+Do NOT generate generic cold emails.
+
+Think like a top-performing SDR + strategist.
 """
 
 
 def _extract_text(response) -> str:
-    """
-    Get response text whether Gemini returned .text (normal) or used
-    candidates[0].content.parts (grounding/thinking models).
-    """
-    if response.text is not None:
+    if response.text:
         return response.text.strip()
-    if not response.candidates:
+    try:
+        parts = response.candidates[0].content.parts
+        return "".join(p.text for p in parts if getattr(p, "text", None)).strip()
+    except Exception:
         return ""
-    c0 = response.candidates[0]
-    content = getattr(c0, "content", None)
-    if content is None:
-        return ""
-    parts = getattr(content, "parts", None) or []
-    texts = [p.text for p in parts if hasattr(p, "text") and p.text]
-    return "".join(texts).strip()
 
 
 def _parse_json(raw: str) -> dict:
-    """Parse JSON from raw string; use regex fallback if wrapped in prose."""
-    raw = raw.strip()
+    raw = re.sub(r"^```(?:json)?\s*", "", raw.strip(), flags=re.IGNORECASE)
+    raw = re.sub(r"\s*```$", "", raw.strip())
     try:
-        return json.loads(raw)
+        return json.loads(raw.strip())
     except json.JSONDecodeError:
         match = re.search(r"\{.*\}", raw, re.DOTALL)
         if match:
             return json.loads(match.group())
-        raise
-
-
-def _research_lead(lead_data: dict, profile: dict) -> str:
-    """
-    Step 1: Use Flash + Google Search to get a plain-text research summary.
-    Grounding works reliably with Flash; avoids empty responses from Pro+tools.
-    """
-    name = lead_data.get("name", "")
-    company = profile.get("current_role", "") or profile.get("headline", "")
-    grounding_tool = types.Tool(google_search=types.GoogleSearch())
-    config = types.GenerateContentConfig(
-        tools=[grounding_tool],
-    )
-    user_message = f"{RESEARCH_PROMPT}\n\nPerson: {name}. Company/role: {company}."
-    response = client.models.generate_content(
-        model=MODEL_RESEARCH,
-        contents=user_message,
-        config=config,
-    )
-    return _extract_text(response) or "(No additional research found.)"
-
-
-def _draft_from_context(
-    research_summary: str, lead_data: dict, profile: dict, model: str
-) -> str:
-    """
-    Step 2: Draft email JSON from research + profile. No tools = guaranteed text output.
-    """
-    config = types.GenerateContentConfig(
-        system_instruction=SYSTEM_PROMPT_DRAFT,
-        temperature=1.0,
-    )
-    user_message = f"""
-Research summary (from web search):
-{research_summary}
-
-Lead:
-- Name: {lead_data["name"]}
-- Email: {lead_data["email"]}
-- LinkedIn: {lead_data["linkedin_url"]}
-
-LinkedIn profile:
-{json.dumps(profile, indent=2)}
-
-Return ONLY the JSON object with "subject" and "body".
-"""
-    response = client.models.generate_content(
-        model=model,
-        contents=user_message,
-        config=config,
-    )
-    return _extract_text(response)
+        raise ValueError(f"Could not parse email JSON:\n{raw[:300]}")
 
 
 def draft_email(lead_data: dict, profile: dict) -> dict:
-    """
-    Two-step flow: (1) Research with Flash + Search, (2) Draft with Pro (no tools).
-    If Pro returns empty, fallback to Flash for the draft. Returns {"subject": str, "body": str}.
-    """
-    research_summary = _research_lead(lead_data, profile)
+    prompt = f"""Prospect Name: {lead_data["name"]}
+LinkedIn URL: {lead_data["linkedin_url"]}
 
-    raw = _draft_from_context(
-        research_summary, lead_data, profile, MODEL_DRAFT
-    )
-    if not raw:
-        raw = _draft_from_context(
-            research_summary, lead_data, profile, MODEL_DRAFT_FALLBACK
-        )
-    if not raw:
-        raise ValueError("Gemini returned no text from both draft models")
+- Headline:        {profile.get("headline")}
+- Current Role:    {profile.get("current_role")}
+- Industry:        {profile.get("industry")}
+- Recent Activity: {profile.get("recent_activity")}
+- Hiring Signals:  {profile.get("hiring_signals")}
+- Recent News:     {profile.get("recent_news")}
 
-    if raw.startswith("```"):
-        raw = raw.split("```")[1]
-        if raw.startswith("json"):
-            raw = raw[4:]
+Generate the cold email JSON now."""
 
-    return _parse_json(raw)
+    for model in [MODEL_DRAFT, MODEL_FALLBACK]:
+        response = _client.models.generate_content(
+            model=model, contents=prompt,
+            config=types.GenerateContentConfig(
+                system_instruction=SYSTEM_PROMPT, temperature=1.0))
+        raw = _extract_text(response)
+        if raw:
+            return _parse_json(raw)
+    raise ValueError("Both models returned empty response.")

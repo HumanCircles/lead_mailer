@@ -47,7 +47,15 @@ def process_lead(lead: dict, fresh_data: bool):
 
 
 def main():
-    fresh_data = os.getenv("ENRICHLAYER_FRESH_DATA", "true").lower() == "true"
+    # Use sheet_config.json "fresh" (RapidAPI) if present, else default True
+    fresh_data = True
+    if os.path.exists("sheet_config.json"):
+        try:
+            import json
+            with open("sheet_config.json") as f:
+                fresh_data = json.load(f).get("fresh", True)
+        except Exception:
+            pass
 
     console.print("[bold magenta]HireQuotient — Personalized Lead Mailer[/bold magenta]")
     console.print("[dim]Reading leads from Google Sheet...[/dim]\n")
