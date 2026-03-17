@@ -1,4 +1,6 @@
 import os
+import time
+import random
 import smtplib
 import itertools
 from email.mime.text import MIMEText
@@ -6,6 +8,10 @@ from email.mime.multipart import MIMEMultipart
 from dotenv import load_dotenv
 
 load_dotenv()
+
+# Warmup: 20–30/day week 1–2, 50–80 week 3–4, 150+ after. Set in .env to ramp up.
+DAILY_LIMIT = int(os.getenv("DAILY_LIMIT_PER_ACCOUNT", "30"))
+WARMUP_PLAIN_ONLY = os.getenv("WARMUP_PLAIN_ONLY", "true").lower() in ("true", "1", "yes")
 
 
 def _load_pool() -> list[tuple[str, str]]:
@@ -32,7 +38,6 @@ def _load_pool() -> list[tuple[str, str]]:
 _pool = _load_pool()
 _cycler = itertools.cycle(_pool)
 _counters: dict[str, int] = {e: 0 for e, _ in _pool}
-DAILY_LIMIT = 450
 
 
 def _next_sender() -> tuple[str, str]:
@@ -52,20 +57,22 @@ def send_email(to_email: str, subject: str, body: str) -> str:
     msg["To"] = to_email
 
     msg.attach(MIMEText(body, "plain"))
-    msg.attach(
-        MIMEText(
-            (
-                "<div style='font-family:Arial,sans-serif;font-size:15px;"
-                "line-height:1.6'>"
-                f"{body.replace(chr(10), '<br>')}</div>"
-            ),
-            "html",
+    if not WARMUP_PLAIN_ONLY:
+        msg.attach(
+            MIMEText(
+                (
+                    "<div style='font-family:Arial,sans-serif;font-size:15px;"
+                    "line-height:1.6'>"
+                    f"{body.replace(chr(10), '<br>')}</div>"
+                ),
+                "html",
+            )
         )
-    )
 
     with smtplib.SMTP_SSL("mail.recruitagents.net", 465) as server:
         server.login(sender_email, app_password)
         server.sendmail(sender_email, to_email, msg.as_string())
 
     _counters[sender_email] += 1
+    time.sleep(random.uniform(1.5, 4.0))
     return f"{sender_email}:{_counters[sender_email]}"

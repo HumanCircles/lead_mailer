@@ -126,6 +126,8 @@ STRICTLY AVOID:
 * “schedule a call”
 
 • Generic or template-like phrasing
+• Links or URLs in the body — one soft CTA only, no links
+• Spam trigger words: "free", "guaranteed", "no obligation", "act now"
 
 ---
 
