@@ -26,7 +26,9 @@ def get_leads(sheet_id: str = None, sheet_tab: str = None) -> list[dict]:
         {
             "name":         r.get("Name", "").strip(),
             "email":        r.get("Email", "").strip(),
-            "linkedin_url": r.get("LinkedIn URL", "").strip(),
+            "company":      r.get("Company", "").strip(),
+            "title":        r.get("Title", "").strip(),
+            "hcm_platform": r.get("HCM Platform", "").strip(),
             "row_index":    idx + 2,
         }
         for idx, r in enumerate(records)

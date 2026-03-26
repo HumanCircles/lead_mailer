@@ -1,0 +1,13 @@
+{
+  "anthropic_api_key": "sk-ant-...",
+  "platform": "instantly",
+  "instantly_api_key": "",
+  "instantly_campaign_id": "",
+  "smartlead_api_key": "",
+  "smartlead_campaign_id": "",
+  "max_workers": 20,
+  "claude_max_concurrent": 40,
+  "claude_model": "claude-haiku-4-5-20251001",
+  "prospects_file": "prospects.csv",
+  "sent_log_file": "sent_log.csv"
+}
