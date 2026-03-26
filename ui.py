@@ -1,6 +1,5 @@
 import csv
 import io
-import json
 import os
 
 import pandas as pd
@@ -28,16 +27,6 @@ st.markdown("""
     div[data-testid="stMetricValue"] { font-size: 1.6rem; }
 </style>
 """, unsafe_allow_html=True)
-
-CONFIG_PATH = "config.json"
-
-# ── Config helpers ────────────────────────────────────────────────────────────
-
-def _load_config() -> dict:
-    if os.path.exists(CONFIG_PATH):
-        with open(CONFIG_PATH) as f:
-            return json.load(f)
-    return {}
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 
@@ -69,44 +58,41 @@ def _normalise(df: pd.DataFrame) -> pd.DataFrame:
 def _to_csv(prospects: list[dict], results: dict) -> bytes:
     buf = io.StringIO()
     w = csv.writer(buf)
-    w.writerow(["first_name","last_name","email","company","title",
-                "hcm_platform","subject","body","status","error"])
+    w.writerow(["first_name", "last_name", "email", "company", "title",
+                "hcm_platform", "subject", "body", "status", "error"])
     for p in prospects:
         r = results.get(_key(p), {})
-        w.writerow([p.get("first_name",""), p.get("last_name",""),
-                    p.get("email",""), p.get("company",""), p.get("title",""),
-                    p.get("hcm_platform",""), r.get("subject",""),
-                    r.get("body",""), r.get("status","pending"), r.get("error","")])
+        w.writerow([p.get("first_name",""), p.get("last_name",""), p.get("email",""),
+                    p.get("company",""), p.get("title",""), p.get("hcm_platform",""),
+                    r.get("subject",""), r.get("body",""),
+                    r.get("status","pending"), r.get("error","")])
     return buf.getvalue().encode()
 
-def _status_color(s: str) -> str:
-    return {"done": "🟢", "sent": "✅", "failed": "🔴", "sending": "🟡"}.get(s, "⚪")
+def _icon(status: str) -> str:
+    return {"done": "🟢", "sent": "✅", "failed": "🔴", "sending": "🟡"}.get(status, "⚪")
 
-# ── Sidebar ───────────────────────────────────────────────────────────────────
-
-cfg = _load_config()
+# ── Sidebar — status only ─────────────────────────────────────────────────────
 
 with st.sidebar:
     st.markdown("## ✉️ BD Outreach")
-    st.caption("CSV → OpenAI → SendGrid")
+    st.caption("CSV → OpenAI → SMTP")
     st.divider()
 
-    import os as _os
-    from dotenv import load_dotenv as _lde; _lde()
-    oai_set    = "✅" if cfg.get("openai_api_key","").startswith("sk-") else "❌"
-    pool_count = len([e for e in _os.getenv("SENDER_POOL","").split(",") if ":" in e])
-    pool_set   = f"✅ {pool_count} accounts" if pool_count else "❌ not set"
+    oai_ok     = "✅" if os.getenv("OPENAI_API_KEY","").startswith("sk-") else "❌ missing"
+    pool_count = len([e for e in os.getenv("SENDER_POOL","").split(",") if ":" in e])
+    pool_ok    = f"✅ {pool_count} senders" if pool_count else "❌ missing"
 
-    st.markdown(f"**OpenAI key:** {oai_set}")
-    st.markdown(f"**Sender pool:** {pool_set}")
-    st.markdown(f"**Model:** `{cfg.get('openai_model','gpt-4.1-mini')}`")
-    st.caption("Edit config.json / .env to change settings")
+    st.markdown(f"**OpenAI key:** {oai_ok}")
+    st.markdown(f"**Sender pool:** {pool_ok}")
+    st.markdown(f"**Model:** `{os.getenv('OPENAI_MODEL','gpt-4.1-mini')}`")
+    st.markdown(f"**SMTP:** `{os.getenv('SMTP_HOST','mail.recruitagents.net')}`")
+    st.caption("Edit `.env` to change settings")
     st.divider()
 
     prospects = st.session_state.prospects
     results   = st.session_state.results
-    n_done    = sum(1 for r in results.values() if r.get("status") in ("done","sent"))
     n_sent    = sum(1 for r in results.values() if r.get("status") == "sent")
+    n_done    = sum(1 for r in results.values() if r.get("status") in ("done","sent"))
     n_fail    = sum(1 for r in results.values() if r.get("status") == "failed")
 
     c1, c2, c3 = st.columns(3)
@@ -116,10 +102,10 @@ with st.sidebar:
     if n_fail:
         st.warning(f"{n_fail} failed")
 
-# ── Main ──────────────────────────────────────────────────────────────────────
+# ── Header ────────────────────────────────────────────────────────────────────
 
 st.markdown("# BD Outreach")
-st.caption("Upload CSV · Generate personalised emails · Preview & send via SendGrid")
+st.caption("Upload CSV · Generate personalised emails · Preview & send")
 st.divider()
 
 # ── Step 1: Upload ────────────────────────────────────────────────────────────
@@ -132,7 +118,8 @@ with st.expander("**Step 1 — Upload prospects CSV**", expanded=not bool(st.ses
             df = _normalise(pd.read_csv(uploaded))
             errs = _validate(df)
             if errs:
-                for e in errs: st.error(e)
+                for e in errs:
+                    st.error(e)
             else:
                 all_cols = list(REQUIRED_COLS | OPTIONAL_COLS)
                 new_prospects = df[[c for c in all_cols if c in df.columns]].fillna("").to_dict("records")
@@ -155,17 +142,19 @@ if not prospects:
 
 st.markdown("### Prospects")
 
-table_data = pd.DataFrame([{
-    "#":       i + 1,
-    "Name":    f"{p['first_name']} {p['last_name']}",
-    "Email":   p["email"],
-    "Company": p["company"],
-    "Title":   p["title"],
-    "":        _status_color(results.get(_key(p), {}).get("status", "pending")),
-} for i, p in enumerate(prospects)])
-
-st.dataframe(table_data, use_container_width=True, hide_index=True,
-             column_config={"": st.column_config.TextColumn(width="small")})
+st.dataframe(
+    pd.DataFrame([{
+        "#":       i + 1,
+        "Name":    f"{p['first_name']} {p['last_name']}",
+        "Email":   p["email"],
+        "Company": p["company"],
+        "Title":   p["title"],
+        "":        _icon(results.get(_key(p), {}).get("status", "pending")),
+    } for i, p in enumerate(prospects)]),
+    width="stretch",
+    hide_index=True,
+    column_config={"": st.column_config.TextColumn(width="small")},
+)
 
 # ── Step 3: Generate ──────────────────────────────────────────────────────────
 
@@ -177,9 +166,7 @@ col_gen, col_dl = st.columns([3, 1])
 with col_gen:
     if st.button(
         f"Generate all  ({len(pending)} pending)" if pending else "✅ All generated",
-        type="primary",
-        disabled=not pending,
-        use_container_width=True,
+        type="primary", disabled=not pending, width="stretch",
     ):
         prog = st.progress(0)
         stat = st.empty()
@@ -190,9 +177,9 @@ with col_gen:
             try:
                 ec = draft_email({
                     "name":         f"{p['first_name']} {p['last_name']}",
-                    "company":      p.get("company",""),
-                    "title":        p.get("title",""),
-                    "hcm_platform": p.get("hcm_platform",""),
+                    "company":      p.get("company", ""),
+                    "title":        p.get("title", ""),
+                    "hcm_platform": p.get("hcm_platform", ""),
                 })
                 st.session_state.results[k] = {"subject": ec["subject"], "body": ec["body"],
                                                 "status": "done", "error": ""}
@@ -205,7 +192,7 @@ with col_dl:
     if n_done:
         st.download_button("⬇ Download CSV", data=_to_csv(prospects, results),
                            file_name="outreach_emails.csv", mime="text/csv",
-                           use_container_width=True)
+                           width="stretch")
 
 # ── Step 4: Preview & Send ────────────────────────────────────────────────────
 
@@ -216,18 +203,18 @@ if not generated:
 
 st.divider()
 
-hdr, send_all_col = st.columns([3, 1])
-hdr.markdown("### Preview & Send")
+hdr_col, send_all_col = st.columns([3, 1])
+hdr_col.markdown("### Preview & Send")
 
 unsent = [p for p in generated if results.get(_key(p), {}).get("status") != "sent"]
 with send_all_col:
     if st.button(f"Send all ({len(unsent)})", type="primary",
-                 disabled=not unsent, use_container_width=True):
+                 disabled=not unsent, width="stretch"):
         prog = st.progress(0)
         stat = st.empty()
         failed = 0
         for i, p in enumerate(unsent):
-            k = _key(p)
+            k   = _key(p)
             res = results[k]
             stat.caption(f"[{i+1}/{len(unsent)}] Sending to {p['first_name']} {p['last_name']}…")
             prog.progress(int((i + 1) / len(unsent) * 100))
@@ -240,10 +227,7 @@ with send_all_col:
                 failed += 1
         prog.empty(); stat.empty()
         sent_n = len(unsent) - failed
-        if failed:
-            st.warning(f"Sent {sent_n}, failed {failed}")
-        else:
-            st.success(f"All {sent_n} emails sent!")
+        st.success(f"Sent {sent_n}" + (f", {failed} failed" if failed else ""))
         st.rerun()
 
 left, right = st.columns([1, 2], gap="large")
@@ -252,13 +236,11 @@ with left:
     st.caption(f"{len(generated)} emails generated")
     for i, p in enumerate(generated):
         k      = _key(p)
-        status = results[k].get("status","done")
-        icon   = _status_color(status)
+        status = results[k].get("status", "done")
         name   = f"{p['first_name']} {p['last_name']}"
-        active = (st.session_state.sel == i)
-        label  = f"{icon} **{name}**  \n{p['company']}"
-        if st.button(label, key=f"sel_{i}", use_container_width=True,
-                     type="primary" if active else "secondary"):
+        if st.button(f"{_icon(status)} **{name}**  \n{p['company']}",
+                     key=f"sel_{i}", width="stretch",
+                     type="primary" if st.session_state.sel == i else "secondary"):
             st.session_state.sel = i
             st.rerun()
 
@@ -269,18 +251,17 @@ with right:
     res = results[k]
 
     name   = f"{p['first_name']} {p['last_name']}"
-    status = res.get("status","done")
+    status = res.get("status", "done")
 
-    st.markdown(f"#### {name}  {_status_color(status)}")
+    st.markdown(f"#### {name}  {_icon(status)}")
     st.caption(f"{p['title']} · {p['company']}" +
                (f" · {p['hcm_platform']}" if p.get("hcm_platform") else ""))
     st.caption(f"📧 {p['email']}")
     st.divider()
 
-    subj = st.text_input("Subject", value=res.get("subject",""), key=f"s_{k}")
-    body = st.text_area("Body", value=res.get("body",""), height=300, key=f"b_{k}")
+    subj = st.text_input("Subject", value=res.get("subject", ""), key=f"s_{k}")
+    body = st.text_area("Body", value=res.get("body", ""), height=300, key=f"b_{k}")
 
-    # Persist edits
     if subj != res.get("subject") or body != res.get("body"):
         st.session_state.results[k]["subject"] = subj
         st.session_state.results[k]["body"]    = body
@@ -290,25 +271,22 @@ with right:
     with btn1:
         st.download_button("⬇ .txt", data=f"Subject: {subj}\n\n{body}".encode(),
                            file_name=f"{name.replace(' ','_')}.txt",
-                           use_container_width=True)
-
+                           width="stretch")
     with btn2:
-        if st.button("↺ Regenerate", use_container_width=True, key=f"regen_{k}"):
+        if st.button("↺ Regenerate", width="stretch", key=f"regen_{k}"):
             with st.spinner("Regenerating…"):
                 try:
                     ec = draft_email({"name": name, "company": p.get("company",""),
                                       "title": p.get("title",""),
                                       "hcm_platform": p.get("hcm_platform","")})
-                    st.session_state.results[k].update(subject=ec["subject"], body=ec["body"],
-                                                        status="done", error="")
+                    st.session_state.results[k].update(subject=ec["subject"],
+                                                        body=ec["body"], status="done", error="")
                 except Exception as e:
                     st.error(str(e))
             st.rerun()
-
     with btn3:
         if status != "sent":
-            if st.button("Send ✉️", type="primary", use_container_width=True, key=f"send_{k}"):
-                st.session_state.results[k]["status"] = "sending"
+            if st.button("Send ✉️", type="primary", width="stretch", key=f"send_{k}"):
                 with st.spinner("Sending…"):
                     try:
                         from_addr = send_email(p["email"], subj, body)

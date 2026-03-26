@@ -1,13 +1,18 @@
-# Local config and caches
-sheet_config.json
-draft_cache.json
-
-# Env and secrets
+# Secrets — never commit
 .env
+*.json
+
+# But DO commit these
+!.env.example
+!MESSAGING_README.md
+
+# Data files
+prospects.csv
+sent_log.csv
 
 # Python
 __pycache__/
 *.py[cod]
+*.egg-info/
 .venv/
 venv/
-config.json

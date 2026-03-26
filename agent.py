@@ -1,9 +1,7 @@
 """
-BD Outreach Agent
-- Reads prospects from prospects.csv
-- Generates personalized emails via OpenAI (MESSAGING_README.md framework)
-- Pushes to Instantly or Smartlead
-- Logs all outcomes to sent_log.csv
+BD Outreach Agent — batch CLI
+Reads prospects.csv → generates emails via OpenAI → pushes to Instantly/Smartlead → logs to sent_log.csv
+Run: python agent.py
 """
 
 import csv
@@ -16,25 +14,28 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 
 import requests
+from dotenv import load_dotenv
 from openai import OpenAI
 
-# ── Config ────────────────────────────────────────────────────────────────────
+load_dotenv()
 
-with open("config.json") as _f:
-    _cfg = json.load(_f)
+# ── Config from env ───────────────────────────────────────────────────────────
 
-PLATFORM           = _cfg.get("platform", "instantly")
-INSTANTLY_API_KEY  = _cfg.get("instantly_api_key", "")
-INSTANTLY_CAMPAIGN = _cfg.get("instantly_campaign_id", "")
-SMARTLEAD_API_KEY  = _cfg.get("smartlead_api_key", "")
-SMARTLEAD_CAMPAIGN = _cfg.get("smartlead_campaign_id", "")
-MAX_WORKERS        = int(_cfg.get("max_workers", 20))
-LLM_MAX_CONCURRENT = int(_cfg.get("llm_max_concurrent", 40))
-PROSPECTS_FILE     = _cfg.get("prospects_file", "prospects.csv")
-SENT_LOG_FILE      = _cfg.get("sent_log_file", "sent_log.csv")
-MODEL              = _cfg.get("openai_model", "gpt-4.1-mini")
+OPENAI_API_KEY     = os.environ["OPENAI_API_KEY"]
+MODEL              = os.getenv("OPENAI_MODEL", "gpt-4.1-mini")
+MAX_WORKERS        = int(os.getenv("MAX_WORKERS", "20"))
+LLM_MAX_CONCURRENT = int(os.getenv("LLM_MAX_CONCURRENT", "40"))
+PROSPECTS_FILE     = os.getenv("PROSPECTS_FILE", "prospects.csv")
+SENT_LOG_FILE      = os.getenv("SENT_LOG_FILE", "sent_log.csv")
 
-_openai   = OpenAI(api_key=_cfg["openai_api_key"])
+# Sending platform — set PLATFORM=instantly or PLATFORM=smartlead in .env
+PLATFORM           = os.getenv("PLATFORM", "instantly")
+INSTANTLY_API_KEY  = os.getenv("INSTANTLY_API_KEY", "")
+INSTANTLY_CAMPAIGN = os.getenv("INSTANTLY_CAMPAIGN_ID", "")
+SMARTLEAD_API_KEY  = os.getenv("SMARTLEAD_API_KEY", "")
+SMARTLEAD_CAMPAIGN = os.getenv("SMARTLEAD_CAMPAIGN_ID", "")
+
+_openai   = OpenAI(api_key=OPENAI_API_KEY)
 _llm_sem  = threading.Semaphore(LLM_MAX_CONCURRENT)
 _log_lock = threading.Lock()
 
@@ -74,7 +75,7 @@ def _append_log(row: dict):
             csv.DictWriter(f, fieldnames=_LOG_HEADERS).writerow(row)
 
 
-def _make_log_row(prospect: dict, subject: str, status: str, error: str = "") -> dict:
+def _log_row(prospect: dict, subject: str, status: str, error: str = "") -> dict:
     return {
         "timestamp":      datetime.now(timezone.utc).isoformat(),
         "prospect_email": prospect["email"],
@@ -91,7 +92,7 @@ def _load_prospects() -> list[dict]:
     with open(PROSPECTS_FILE) as f:
         return list(csv.DictReader(f))
 
-# ── Claude generation ─────────────────────────────────────────────────────────
+# ── Generation ────────────────────────────────────────────────────────────────
 
 def _parse_json(raw: str) -> dict:
     raw = re.sub(r"^```(?:json)?\s*", "", raw.strip(), flags=re.IGNORECASE)
@@ -105,7 +106,7 @@ def _parse_json(raw: str) -> dict:
         raise ValueError(f"Could not parse JSON:\n{raw[:300]}")
 
 
-def _generate_email(prospect: dict) -> dict:
+def _generate(prospect: dict) -> dict:
     name     = f"{prospect['first_name']} {prospect['last_name']}"
     company  = prospect.get("company", "")
     title    = prospect.get("title", "")
@@ -117,19 +118,11 @@ def _generate_email(prospect: dict) -> dict:
 - Company: {company}
 - Platform: {platform}
 
-Use your knowledge about this company, their industry, and the person's role to craft a sharp email following the 5-beat framework. For Beat 1, draw on any publicly known signal about the prospect or company — a product launch, a press mention, a known initiative, or a clear industry-level observation tied to their specific segment.
-
-Write the email. Return JSON only — no markdown, no preamble:
+Write the email following the playbook exactly. Return JSON only — no markdown, no preamble:
 {{
   "subject": "...",
   "body": "..."
-}}
-
-Rules:
-- Body is plain text. No markdown, no bold, no bullet points, no HTML.
-- Every sentence must map to one of the five beats in the playbook.
-- If a beat cannot be written with confidence, compress the email rather than write a filler sentence.
-- Subject must follow exactly: Invite for discussion | [3-4 word pain point hook]"""
+}}"""
 
     with _llm_sem:
         for attempt in range(2):
@@ -152,7 +145,7 @@ Rules:
 
     raise ValueError("Model returned empty response.")
 
-# ── Platform sending ──────────────────────────────────────────────────────────
+# ── Platform push ─────────────────────────────────────────────────────────────
 
 def _api_call(method: str, url: str, **kwargs):
     backoffs = [5, 15, 45]
@@ -167,7 +160,6 @@ def _api_call(method: str, url: str, **kwargs):
             if attempt == 0:
                 time.sleep(10)
             continue
-
         if resp.status_code in (200, 201):
             return
         if resp.status_code == 400:
@@ -179,85 +171,63 @@ def _api_call(method: str, url: str, **kwargs):
                 continue
             raise ValueError(f"429 rate limited after {attempt + 1} retries")
         if resp.status_code >= 500:
-            last_err = ValueError(f"{resp.status_code} server error: {resp.text[:200]}")
+            last_err = ValueError(f"{resp.status_code}: {resp.text[:200]}")
             continue
         resp.raise_for_status()
-
     raise last_err or ValueError("API call failed after retries")
 
 
-def _push_instantly(prospect: dict, subject: str, body: str):
-    _api_call(
-        "POST",
-        "https://api.instantly.ai/api/v1/lead/add",
-        json={
-            "api_key":              INSTANTLY_API_KEY,
-            "campaign_id":          INSTANTLY_CAMPAIGN,
-            "skip_if_in_workspace": True,
-            "leads": [{
-                "email":        prospect["email"],
-                "first_name":   prospect["first_name"],
-                "last_name":    prospect["last_name"],
-                "company_name": prospect.get("company", ""),
-                "custom_variables": {
-                    "custom_subject": subject,
-                    "custom_body":    body,
-                },
-            }],
-        },
-    )
-
-
-def _push_smartlead(prospect: dict, subject: str, body: str):
-    _api_call(
-        "POST",
-        "https://server.smartlead.ai/api/v1/leads",
-        params={"api_key": SMARTLEAD_API_KEY},
-        json={
-            "campaign_id": SMARTLEAD_CAMPAIGN,
-            "lead_list": [{
-                "email":        prospect["email"],
-                "first_name":   prospect["first_name"],
-                "last_name":    prospect["last_name"],
-                "company_name": prospect.get("company", ""),
-                "custom_fields": {
-                    "custom_subject": subject,
-                    "custom_body":    body,
-                },
-            }],
-        },
-    )
-
-
 def _push(prospect: dict, subject: str, body: str):
-    if PLATFORM == "instantly":
-        _push_instantly(prospect, subject, body)
+    if PLATFORM == "smartlead":
+        _api_call(
+            "POST", "https://server.smartlead.ai/api/v1/leads",
+            params={"api_key": SMARTLEAD_API_KEY},
+            json={
+                "campaign_id": SMARTLEAD_CAMPAIGN,
+                "lead_list": [{
+                    "email": prospect["email"],
+                    "first_name": prospect["first_name"],
+                    "last_name": prospect["last_name"],
+                    "company_name": prospect.get("company", ""),
+                    "custom_fields": {"custom_subject": subject, "custom_body": body},
+                }],
+            },
+        )
     else:
-        _push_smartlead(prospect, subject, body)
+        _api_call(
+            "POST", "https://api.instantly.ai/api/v1/lead/add",
+            json={
+                "api_key": INSTANTLY_API_KEY,
+                "campaign_id": INSTANTLY_CAMPAIGN,
+                "skip_if_in_workspace": True,
+                "leads": [{
+                    "email": prospect["email"],
+                    "first_name": prospect["first_name"],
+                    "last_name": prospect["last_name"],
+                    "company_name": prospect.get("company", ""),
+                    "custom_variables": {"custom_subject": subject, "custom_body": body},
+                }],
+            },
+        )
 
 # ── Per-prospect pipeline ─────────────────────────────────────────────────────
 
 def _process(prospect: dict) -> dict:
-    # Step 1: Claude generation
     try:
-        email_content = _generate_email(prospect)
+        ec = _generate(prospect)
     except Exception as e:
-        row = _make_log_row(prospect, "", "failed_generation", str(e))
+        row = _log_row(prospect, "", "failed_generation", str(e))
         _append_log(row)
         return row
 
-    subject = email_content["subject"]
-    body    = email_content["body"]
-
-    # Step 2: Push to platform
     try:
-        _push(prospect, subject, body)
+        _push(prospect, ec["subject"], ec["body"])
     except Exception as e:
-        row = _make_log_row(prospect, subject, "failed_api", str(e))
+        row = _log_row(prospect, ec["subject"], "failed_api", str(e))
         _append_log(row)
         return row
 
-    row = _make_log_row(prospect, subject, "pushed")
+    row = _log_row(prospect, ec["subject"], "pushed")
     _append_log(row)
     return row
 
@@ -265,29 +235,16 @@ def _process(prospect: dict) -> dict:
 
 def main():
     _init_log()
-    sent_emails = _load_sent_emails()
-
+    sent = _load_sent_emails()
     all_prospects = _load_prospects()
-    pending    = []
-    duplicates = []
 
-    for p in all_prospects:
-        email = p.get("email", "").strip()
-        if not email:
-            continue
-        if email in sent_emails:
-            duplicates.append(p)
-        else:
-            pending.append(p)
+    pending    = [p for p in all_prospects if p.get("email", "").strip() not in sent]
+    duplicates = [p for p in all_prospects if p.get("email", "").strip() in sent]
 
-    print(
-        f"Loaded {len(all_prospects)} prospects — "
-        f"{len(duplicates)} already pushed, "
-        f"{len(pending)} to process"
-    )
+    print(f"Loaded {len(all_prospects)} prospects — {len(duplicates)} already pushed, {len(pending)} to process")
 
     for p in duplicates:
-        _append_log(_make_log_row(p, "", "skipped_duplicate"))
+        _append_log(_log_row(p, "", "skipped_duplicate"))
 
     counts: dict[str, int] = {}
 
@@ -297,12 +254,10 @@ def main():
             row    = future.result()
             status = row["status"]
             counts[status] = counts.get(status, 0) + 1
-            detail = row.get("subject") or row.get("error", "")
-            print(f"[{status}] {row['prospect_name']} — {detail}")
+            print(f"[{status}] {row['prospect_name']} — {row.get('subject') or row.get('error', '')}")
 
     print(
-        f"\nDone — "
-        f"pushed: {counts.get('pushed', 0)}, "
+        f"\nDone — pushed: {counts.get('pushed', 0)}, "
         f"failed_generation: {counts.get('failed_generation', 0)}, "
         f"failed_api: {counts.get('failed_api', 0)}"
     )
