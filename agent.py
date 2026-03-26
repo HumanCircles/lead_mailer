@@ -1,7 +1,7 @@
 """
 BD Outreach Agent
 - Reads prospects from prospects.csv
-- Generates personalized emails via Claude (MESSAGING_README.md framework)
+- Generates personalized emails via OpenAI (MESSAGING_README.md framework)
 - Pushes to Instantly or Smartlead
 - Logs all outcomes to sent_log.csv
 """
@@ -16,27 +16,27 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 
 import requests
-from anthropic import Anthropic
+from openai import OpenAI
 
 # ── Config ────────────────────────────────────────────────────────────────────
 
 with open("config.json") as _f:
     _cfg = json.load(_f)
 
-PLATFORM             = _cfg.get("platform", "instantly")
-INSTANTLY_API_KEY    = _cfg.get("instantly_api_key", "")
-INSTANTLY_CAMPAIGN   = _cfg.get("instantly_campaign_id", "")
-SMARTLEAD_API_KEY    = _cfg.get("smartlead_api_key", "")
-SMARTLEAD_CAMPAIGN   = _cfg.get("smartlead_campaign_id", "")
-MAX_WORKERS          = int(_cfg.get("max_workers", 20))
-CLAUDE_MAX_CONCURRENT = int(_cfg.get("claude_max_concurrent", 40))
-PROSPECTS_FILE       = _cfg.get("prospects_file", "prospects.csv")
-SENT_LOG_FILE        = _cfg.get("sent_log_file", "sent_log.csv")
-MODEL                = _cfg.get("claude_model", "claude-haiku-4-5-20251001")
+PLATFORM           = _cfg.get("platform", "instantly")
+INSTANTLY_API_KEY  = _cfg.get("instantly_api_key", "")
+INSTANTLY_CAMPAIGN = _cfg.get("instantly_campaign_id", "")
+SMARTLEAD_API_KEY  = _cfg.get("smartlead_api_key", "")
+SMARTLEAD_CAMPAIGN = _cfg.get("smartlead_campaign_id", "")
+MAX_WORKERS        = int(_cfg.get("max_workers", 20))
+LLM_MAX_CONCURRENT = int(_cfg.get("llm_max_concurrent", 40))
+PROSPECTS_FILE     = _cfg.get("prospects_file", "prospects.csv")
+SENT_LOG_FILE      = _cfg.get("sent_log_file", "sent_log.csv")
+MODEL              = _cfg.get("openai_model", "gpt-4.1-mini")
 
-_anthropic  = Anthropic(api_key=_cfg["anthropic_api_key"])
-_claude_sem = threading.Semaphore(CLAUDE_MAX_CONCURRENT)
-_log_lock   = threading.Lock()
+_openai   = OpenAI(api_key=_cfg["openai_api_key"])
+_llm_sem  = threading.Semaphore(LLM_MAX_CONCURRENT)
+_log_lock = threading.Lock()
 
 # ── Messaging guide ───────────────────────────────────────────────────────────
 
@@ -131,15 +131,17 @@ Rules:
 - If a beat cannot be written with confidence, compress the email rather than write a filler sentence.
 - Subject must follow exactly: Invite for discussion | [3-4 word pain point hook]"""
 
-    with _claude_sem:
+    with _llm_sem:
         for attempt in range(2):
-            resp = _anthropic.messages.create(
+            resp = _openai.chat.completions.create(
                 model=MODEL,
                 max_tokens=1024,
-                system=MESSAGING_GUIDE,
-                messages=[{"role": "user", "content": prompt}],
+                messages=[
+                    {"role": "system", "content": MESSAGING_GUIDE},
+                    {"role": "user",   "content": prompt},
+                ],
             )
-            raw = resp.content[0].text.strip()
+            raw = (resp.choices[0].message.content or "").strip()
             if raw:
                 try:
                     return _parse_json(raw)

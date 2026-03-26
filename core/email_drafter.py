@@ -1,11 +1,19 @@
 import os, re, json
-from anthropic import Anthropic
+from openai import OpenAI
 from dotenv import load_dotenv
 
 load_dotenv()
 
-_client = Anthropic(api_key=os.getenv("ANTHROPIC_API_KEY"))
-MODEL = "claude-haiku-4-5-20251001"
+def _load_openai_config() -> tuple[str, str]:
+    cfg_path = os.path.join(os.path.dirname(os.path.dirname(__file__)), "config.json")
+    if os.path.exists(cfg_path):
+        with open(cfg_path) as f:
+            cfg = json.load(f)
+        return cfg.get("openai_api_key", ""), cfg.get("openai_model", "gpt-4.1-mini")
+    return os.getenv("OPENAI_API_KEY", ""), os.getenv("OPENAI_MODEL", "gpt-4.1-mini")
+
+_api_key, MODEL = _load_openai_config()
+_client = OpenAI(api_key=_api_key)
 
 _GUIDE_PATH = os.path.join(os.path.dirname(os.path.dirname(__file__)), "MESSAGING_README.md")
 with open(_GUIDE_PATH) as _f:
@@ -25,10 +33,10 @@ def _parse_json(raw: str) -> dict:
 
 
 def draft_email(lead_data: dict) -> dict:
-    name         = lead_data.get("name", "")
-    company      = lead_data.get("company", "")
-    title        = lead_data.get("title", "")
-    platform     = lead_data.get("hcm_platform", "") or company
+    name     = lead_data.get("name", "")
+    company  = lead_data.get("company", "")
+    title    = lead_data.get("title", "")
+    platform = lead_data.get("hcm_platform", "") or company
 
     prompt = f"""Prospect:
 - Name: {name}
@@ -51,13 +59,15 @@ Rules:
 - Subject must follow exactly: Invite for discussion | [3-4 word pain point hook]"""
 
     for attempt in range(2):
-        response = _client.messages.create(
+        resp = _client.chat.completions.create(
             model=MODEL,
             max_tokens=1024,
-            system=MESSAGING_GUIDE,
-            messages=[{"role": "user", "content": prompt}],
+            messages=[
+                {"role": "system", "content": MESSAGING_GUIDE},
+                {"role": "user",   "content": prompt},
+            ],
         )
-        raw = response.content[0].text.strip()
+        raw = (resp.choices[0].message.content or "").strip()
         if raw:
             try:
                 return _parse_json(raw)
