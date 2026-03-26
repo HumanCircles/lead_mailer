@@ -10,283 +10,288 @@ from dotenv import load_dotenv
 load_dotenv()
 
 from core.email_drafter import draft_email
+from core.gmail_sender  import send_email
 
 # ── Page config ───────────────────────────────────────────────────────────────
 
 st.set_page_config(
-    page_title="BD Outreach — Email Previewer",
+    page_title="BD Outreach",
+    page_icon="✉️",
     layout="wide",
     initial_sidebar_state="collapsed",
 )
 
 st.markdown("""
 <style>
-    .block-container { padding-top: 2rem; max-width: 1100px; }
+    .block-container { padding-top: 1.5rem; max-width: 1200px; }
     footer { visibility: hidden; }
-    .status-badge {
-        display: inline-block;
-        padding: 2px 10px;
-        border-radius: 12px;
-        font-size: 12px;
-        font-weight: 600;
-    }
-    .badge-pending  { background: #1e293b; color: #94a3b8; }
-    .badge-done     { background: #14532d; color: #86efac; }
-    .badge-failed   { background: #450a0a; color: #fca5a5; }
+    div[data-testid="stMetricValue"] { font-size: 1.6rem; }
 </style>
 """, unsafe_allow_html=True)
+
+CONFIG_PATH = "config.json"
+
+# ── Config helpers ────────────────────────────────────────────────────────────
+
+def _load_config() -> dict:
+    if os.path.exists(CONFIG_PATH):
+        with open(CONFIG_PATH) as f:
+            return json.load(f)
+    return {}
 
 # ── Constants ─────────────────────────────────────────────────────────────────
 
 REQUIRED_COLS = {"first_name", "last_name", "email", "company", "title"}
 OPTIONAL_COLS = {"hcm_platform"}
-ALL_COLS      = REQUIRED_COLS | OPTIONAL_COLS
+
+# ── Session defaults ──────────────────────────────────────────────────────────
+
+for k, v in [("prospects", []), ("results", {}), ("sel", 0)]:
+    if k not in st.session_state:
+        st.session_state[k] = v
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
-def _validate_csv(df: pd.DataFrame) -> list[str]:
-    missing = REQUIRED_COLS - set(c.lower().strip() for c in df.columns)
-    return [f"Missing column: `{c}`" for c in sorted(missing)]
-
-
-def _normalise_cols(df: pd.DataFrame) -> pd.DataFrame:
-    df.columns = [c.lower().strip() for c in df.columns]
-    for col in OPTIONAL_COLS:
-        if col not in df.columns:
-            df[col] = ""
-    return df
-
-
-def _prospect_key(p: dict) -> str:
+def _key(p: dict) -> str:
     return p.get("email", "").strip().lower()
 
+def _validate(df: pd.DataFrame) -> list[str]:
+    cols = {c.lower().strip() for c in df.columns}
+    return [f"Missing column: `{c}`" for c in sorted(REQUIRED_COLS - cols)]
 
-def _generate_for_prospect(prospect: dict) -> dict:
-    lead = {
-        "name":         f"{prospect.get('first_name', '')} {prospect.get('last_name', '')}".strip(),
-        "company":      prospect.get("company", ""),
-        "title":        prospect.get("title", ""),
-        "hcm_platform": prospect.get("hcm_platform", ""),
-    }
-    return draft_email(lead)
+def _normalise(df: pd.DataFrame) -> pd.DataFrame:
+    df.columns = [c.lower().strip() for c in df.columns]
+    for c in OPTIONAL_COLS:
+        if c not in df.columns:
+            df[c] = ""
+    return df
 
-
-def _results_to_csv(prospects: list[dict], results: dict) -> bytes:
+def _to_csv(prospects: list[dict], results: dict) -> bytes:
     buf = io.StringIO()
-    writer = csv.writer(buf)
-    writer.writerow(["first_name", "last_name", "email", "company", "title",
-                     "hcm_platform", "subject", "body", "status", "error"])
+    w = csv.writer(buf)
+    w.writerow(["first_name","last_name","email","company","title",
+                "hcm_platform","subject","body","status","error"])
     for p in prospects:
-        key = _prospect_key(p)
-        res = results.get(key, {})
-        writer.writerow([
-            p.get("first_name", ""),
-            p.get("last_name", ""),
-            p.get("email", ""),
-            p.get("company", ""),
-            p.get("title", ""),
-            p.get("hcm_platform", ""),
-            res.get("subject", ""),
-            res.get("body", ""),
-            res.get("status", "pending"),
-            res.get("error", ""),
-        ])
+        r = results.get(_key(p), {})
+        w.writerow([p.get("first_name",""), p.get("last_name",""),
+                    p.get("email",""), p.get("company",""), p.get("title",""),
+                    p.get("hcm_platform",""), r.get("subject",""),
+                    r.get("body",""), r.get("status","pending"), r.get("error","")])
     return buf.getvalue().encode()
 
-# ── Session state defaults ────────────────────────────────────────────────────
+def _status_color(s: str) -> str:
+    return {"done": "🟢", "sent": "✅", "failed": "🔴", "sending": "🟡"}.get(s, "⚪")
 
-if "prospects" not in st.session_state:
-    st.session_state.prospects = []
-if "results" not in st.session_state:
-    st.session_state.results = {}   # email → {subject, body, status, error}
-if "selected_idx" not in st.session_state:
-    st.session_state.selected_idx = 0
+# ── Sidebar ───────────────────────────────────────────────────────────────────
 
-# ── Header ────────────────────────────────────────────────────────────────────
+cfg = _load_config()
 
-st.markdown("## BD Outreach — Email Previewer")
-st.caption("Upload prospects CSV → generate emails → review & download")
+with st.sidebar:
+    st.markdown("## ✉️ BD Outreach")
+    st.caption("CSV → OpenAI → SendGrid")
+    st.divider()
+
+    import os as _os
+    from dotenv import load_dotenv as _lde; _lde()
+    oai_set    = "✅" if cfg.get("openai_api_key","").startswith("sk-") else "❌"
+    pool_count = len([e for e in _os.getenv("SENDER_POOL","").split(",") if ":" in e])
+    pool_set   = f"✅ {pool_count} accounts" if pool_count else "❌ not set"
+
+    st.markdown(f"**OpenAI key:** {oai_set}")
+    st.markdown(f"**Sender pool:** {pool_set}")
+    st.markdown(f"**Model:** `{cfg.get('openai_model','gpt-4.1-mini')}`")
+    st.caption("Edit config.json / .env to change settings")
+    st.divider()
+
+    prospects = st.session_state.prospects
+    results   = st.session_state.results
+    n_done    = sum(1 for r in results.values() if r.get("status") in ("done","sent"))
+    n_sent    = sum(1 for r in results.values() if r.get("status") == "sent")
+    n_fail    = sum(1 for r in results.values() if r.get("status") == "failed")
+
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Total",     len(prospects))
+    c2.metric("Generated", n_done)
+    c3.metric("Sent",      n_sent)
+    if n_fail:
+        st.warning(f"{n_fail} failed")
+
+# ── Main ──────────────────────────────────────────────────────────────────────
+
+st.markdown("# BD Outreach")
+st.caption("Upload CSV · Generate personalised emails · Preview & send via SendGrid")
 st.divider()
 
 # ── Step 1: Upload ────────────────────────────────────────────────────────────
 
-st.markdown("### 1. Upload prospects CSV")
-st.caption("Required columns: `first_name`, `last_name`, `email`, `company`, `title` · Optional: `hcm_platform`")
-
-uploaded = st.file_uploader("Choose CSV", type=["csv"], label_visibility="collapsed")
-
-if uploaded:
-    try:
-        df = pd.read_csv(uploaded)
-        df = _normalise_cols(df)
-        errors = _validate_csv(df)
-        if errors:
-            for e in errors:
-                st.error(e)
-        else:
-            prospects = df[sorted(ALL_COLS)].fillna("").to_dict("records")
-            if prospects != st.session_state.prospects:
-                st.session_state.prospects  = prospects
-                st.session_state.results    = {}
-                st.session_state.selected_idx = 0
-            st.success(f"Loaded **{len(prospects)}** prospects")
-    except Exception as e:
-        st.error(f"Could not parse CSV: {e}")
+with st.expander("**Step 1 — Upload prospects CSV**", expanded=not bool(st.session_state.prospects)):
+    st.caption("Required: `first_name` `last_name` `email` `company` `title`  ·  Optional: `hcm_platform`")
+    uploaded = st.file_uploader("CSV file", type=["csv"], label_visibility="collapsed")
+    if uploaded:
+        try:
+            df = _normalise(pd.read_csv(uploaded))
+            errs = _validate(df)
+            if errs:
+                for e in errs: st.error(e)
+            else:
+                all_cols = list(REQUIRED_COLS | OPTIONAL_COLS)
+                new_prospects = df[[c for c in all_cols if c in df.columns]].fillna("").to_dict("records")
+                if new_prospects != st.session_state.prospects:
+                    st.session_state.prospects = new_prospects
+                    st.session_state.results   = {}
+                    st.session_state.sel       = 0
+                st.success(f"Loaded **{len(new_prospects)}** prospects")
+        except Exception as e:
+            st.error(f"Could not read CSV: {e}")
 
 prospects: list[dict] = st.session_state.prospects
+results:   dict       = st.session_state.results
 
 if not prospects:
-    st.info("Upload a CSV to get started.")
+    st.info("Upload a CSV above to get started.")
     st.stop()
 
-# ── Step 2: Preview table ─────────────────────────────────────────────────────
+# ── Step 2: Prospects table ───────────────────────────────────────────────────
 
-st.markdown("### 2. Prospects")
+st.markdown("### Prospects")
 
-results: dict = st.session_state.results
-
-def _badge(email: str) -> str:
-    res = results.get(email.lower().strip(), {})
-    s = res.get("status", "pending")
-    cls = {"done": "badge-done", "failed": "badge-failed"}.get(s, "badge-pending")
-    return f'<span class="status-badge {cls}">{s}</span>'
-
-preview_df = pd.DataFrame([{
-    "#":          i + 1,
-    "Name":       f"{p['first_name']} {p['last_name']}",
-    "Email":      p["email"],
-    "Company":    p["company"],
-    "Title":      p["title"],
-    "Platform":   p.get("hcm_platform", ""),
-    "Status":     results.get(_prospect_key(p), {}).get("status", "pending"),
+table_data = pd.DataFrame([{
+    "#":       i + 1,
+    "Name":    f"{p['first_name']} {p['last_name']}",
+    "Email":   p["email"],
+    "Company": p["company"],
+    "Title":   p["title"],
+    "":        _status_color(results.get(_key(p), {}).get("status", "pending")),
 } for i, p in enumerate(prospects)])
 
-st.dataframe(preview_df, use_container_width=True, hide_index=True,
-             column_config={"Status": st.column_config.TextColumn(width="small")})
+st.dataframe(table_data, use_container_width=True, hide_index=True,
+             column_config={"": st.column_config.TextColumn(width="small")})
 
 # ── Step 3: Generate ──────────────────────────────────────────────────────────
 
-st.markdown("### 3. Generate emails")
+st.markdown("### Generate emails")
+
+pending = [p for p in prospects if results.get(_key(p), {}).get("status") not in ("done","sent")]
 
 col_gen, col_dl = st.columns([3, 1])
-
-done_count    = sum(1 for r in results.values() if r.get("status") == "done")
-pending_count = len(prospects) - done_count
-
 with col_gen:
-    gen_label = f"Generate all ({pending_count} pending)" if pending_count else "All generated"
-    if st.button(gen_label, type="primary", disabled=(pending_count == 0), use_container_width=True):
+    if st.button(
+        f"Generate all  ({len(pending)} pending)" if pending else "✅ All generated",
+        type="primary",
+        disabled=not pending,
+        use_container_width=True,
+    ):
         prog = st.progress(0)
         stat = st.empty()
-        to_run = [p for p in prospects if results.get(_prospect_key(p), {}).get("status") != "done"]
-        for i, p in enumerate(to_run):
-            name = f"{p['first_name']} {p['last_name']}"
-            stat.caption(f"[{i+1}/{len(to_run)}] Drafting for {name}…")
-            prog.progress(int((i + 1) / len(to_run) * 100))
-            key = _prospect_key(p)
+        for i, p in enumerate(pending):
+            stat.caption(f"[{i+1}/{len(pending)}] Drafting for {p['first_name']} {p['last_name']}…")
+            prog.progress(int((i + 1) / len(pending) * 100))
+            k = _key(p)
             try:
-                ec = _generate_for_prospect(p)
-                st.session_state.results[key] = {
-                    "subject": ec["subject"],
-                    "body":    ec["body"],
-                    "status":  "done",
-                    "error":   "",
-                }
+                ec = draft_email({
+                    "name":         f"{p['first_name']} {p['last_name']}",
+                    "company":      p.get("company",""),
+                    "title":        p.get("title",""),
+                    "hcm_platform": p.get("hcm_platform",""),
+                })
+                st.session_state.results[k] = {"subject": ec["subject"], "body": ec["body"],
+                                                "status": "done", "error": ""}
             except Exception as e:
-                st.session_state.results[key] = {
-                    "subject": "", "body": "",
-                    "status": "failed", "error": str(e),
-                }
-        prog.empty()
-        stat.empty()
+                st.session_state.results[k] = {"subject":"","body":"","status":"failed","error":str(e)}
+        prog.empty(); stat.empty()
         st.rerun()
 
 with col_dl:
-    if done_count:
-        st.download_button(
-            "Download CSV",
-            data=_results_to_csv(prospects, results),
-            file_name="outreach_emails.csv",
-            mime="text/csv",
-            use_container_width=True,
-        )
+    if n_done:
+        st.download_button("⬇ Download CSV", data=_to_csv(prospects, results),
+                           file_name="outreach_emails.csv", mime="text/csv",
+                           use_container_width=True)
 
-# ── Step 4: Per-prospect preview ──────────────────────────────────────────────
+# ── Step 4: Preview & Send ────────────────────────────────────────────────────
 
-generated = [p for p in prospects if results.get(_prospect_key(p), {}).get("status") == "done"]
+generated = [p for p in prospects if results.get(_key(p), {}).get("status") in ("done","sent")]
 
 if not generated:
     st.stop()
 
 st.divider()
-st.markdown("### 4. Email preview")
+st.markdown("### Preview & Send")
 
-left_col, right_col = st.columns([1, 2], gap="large")
+left, right = st.columns([1, 2], gap="large")
 
-with left_col:
-    st.caption("Select a prospect to preview their email")
+with left:
+    st.caption(f"{len(generated)} emails generated")
     for i, p in enumerate(generated):
-        key    = _prospect_key(p)
+        k      = _key(p)
+        status = results[k].get("status","done")
+        icon   = _status_color(status)
         name   = f"{p['first_name']} {p['last_name']}"
-        subj   = results[key].get("subject", "")[:55]
-        active = (st.session_state.selected_idx == i)
-        label  = f"**{name}**\n{p['company']} · {p['title']}"
-        btn_type = "primary" if active else "secondary"
-        if st.button(label, key=f"sel_{i}", use_container_width=True, type=btn_type):
-            st.session_state.selected_idx = i
+        active = (st.session_state.sel == i)
+        label  = f"{icon} **{name}**  \n{p['company']}"
+        if st.button(label, key=f"sel_{i}", use_container_width=True,
+                     type="primary" if active else "secondary"):
+            st.session_state.sel = i
             st.rerun()
 
-with right_col:
-    idx = min(st.session_state.selected_idx, len(generated) - 1)
+with right:
+    idx = min(st.session_state.sel, len(generated) - 1)
     p   = generated[idx]
-    key = _prospect_key(p)
-    res = results[key]
+    k   = _key(p)
+    res = results[k]
 
-    name = f"{p['first_name']} {p['last_name']}"
-    st.markdown(f"#### {name}")
-    st.caption(f"{p['title']} · {p['company']}" + (f" · {p['hcm_platform']}" if p.get("hcm_platform") else ""))
+    name   = f"{p['first_name']} {p['last_name']}"
+    status = res.get("status","done")
+
+    st.markdown(f"#### {name}  {_status_color(status)}")
+    st.caption(f"{p['title']} · {p['company']}" +
+               (f" · {p['hcm_platform']}" if p.get("hcm_platform") else ""))
     st.caption(f"📧 {p['email']}")
     st.divider()
 
-    st.markdown("**Subject**")
-    subject_val = st.text_input(
-        "subject_edit", value=res["subject"],
-        label_visibility="collapsed", key=f"subj_{key}"
-    )
+    subj = st.text_input("Subject", value=res.get("subject",""), key=f"s_{k}")
+    body = st.text_area("Body", value=res.get("body",""), height=300, key=f"b_{k}")
 
-    st.markdown("**Body**")
-    body_val = st.text_area(
-        "body_edit", value=res["body"], height=320,
-        label_visibility="collapsed", key=f"body_{key}"
-    )
+    # Persist edits
+    if subj != res.get("subject") or body != res.get("body"):
+        st.session_state.results[k]["subject"] = subj
+        st.session_state.results[k]["body"]    = body
 
-    # Save edits back
-    if subject_val != res["subject"] or body_val != res["body"]:
-        st.session_state.results[key]["subject"] = subject_val
-        st.session_state.results[key]["body"]    = body_val
+    btn1, btn2, btn3 = st.columns(3)
 
-    btn_a, btn_b = st.columns(2)
-    with btn_a:
-        full_text = f"Subject: {subject_val}\n\n{body_val}"
-        st.download_button(
-            "Download .txt",
-            data=full_text.encode(),
-            file_name=f"{name.replace(' ', '_')}.txt",
-            mime="text/plain",
-            use_container_width=True,
-        )
-    with btn_b:
-        # Regenerate this one prospect
-        if st.button("Regenerate", use_container_width=True, key=f"regen_{key}"):
+    with btn1:
+        st.download_button("⬇ .txt", data=f"Subject: {subj}\n\n{body}".encode(),
+                           file_name=f"{name.replace(' ','_')}.txt",
+                           use_container_width=True)
+
+    with btn2:
+        if st.button("↺ Regenerate", use_container_width=True, key=f"regen_{k}"):
             with st.spinner("Regenerating…"):
                 try:
-                    ec = _generate_for_prospect(p)
-                    st.session_state.results[key] = {
-                        "subject": ec["subject"],
-                        "body":    ec["body"],
-                        "status":  "done",
-                        "error":   "",
-                    }
+                    ec = draft_email({"name": name, "company": p.get("company",""),
+                                      "title": p.get("title",""),
+                                      "hcm_platform": p.get("hcm_platform","")})
+                    st.session_state.results[k].update(subject=ec["subject"], body=ec["body"],
+                                                        status="done", error="")
                 except Exception as e:
                     st.error(str(e))
             st.rerun()
+
+    with btn3:
+        if status != "sent":
+            if st.button("Send ✉️", type="primary", use_container_width=True, key=f"send_{k}"):
+                st.session_state.results[k]["status"] = "sending"
+                with st.spinner("Sending…"):
+                    try:
+                        from_addr = send_email(p["email"], subj, body)
+                        st.session_state.results[k]["status"] = "sent"
+                        st.success(f"Sent via {from_addr}")
+                    except Exception as e:
+                        st.session_state.results[k]["status"] = "failed"
+                        st.session_state.results[k]["error"]  = str(e)
+                        st.error(str(e))
+                st.rerun()
+        else:
+            st.success("Sent ✅")
+
+    if res.get("error"):
+        st.error(res["error"])

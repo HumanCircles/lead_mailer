@@ -9,4 +9,5 @@ tenacity>=8.3.0
 rich>=13.7.0
 streamlit>=1.40.0
 requests>=2.31.0
+sendgrid>=6.11.0
 pandas>=2.0.0

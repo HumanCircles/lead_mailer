@@ -9,9 +9,7 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-# Warmup: 20–30/day week 1–2, 50–80 week 3–4, 150+ after. Set in .env to ramp up.
-DAILY_LIMIT = int(os.getenv("DAILY_LIMIT_PER_ACCOUNT", "30"))
-WARMUP_PLAIN_ONLY = os.getenv("WARMUP_PLAIN_ONLY", "true").lower() in ("true", "1", "yes")
+DAILY_LIMIT = int(os.getenv("DAILY_LIMIT_PER_ACCOUNT", "150"))
 
 
 def _load_pool() -> list[tuple[str, str]]:
@@ -26,17 +24,16 @@ def _load_pool() -> list[tuple[str, str]]:
         if pairs:
             return pairs
 
-    # fallback to single sender
     email = os.getenv("SENDER_EMAIL", "")
-    pwd = os.getenv("SENDER_APP_PASSWORD", "")
+    pwd   = os.getenv("SENDER_APP_PASSWORD", "")
     if email and pwd:
         return [(email, pwd)]
 
     raise ValueError("Set SENDER_POOL or SENDER_EMAIL + SENDER_APP_PASSWORD in .env")
 
 
-_pool = _load_pool()
-_cycler = itertools.cycle(_pool)
+_pool     = _load_pool()
+_cycler   = itertools.cycle(_pool)
 _counters: dict[str, int] = {e: 0 for e, _ in _pool}
 
 
@@ -53,21 +50,9 @@ def send_email(to_email: str, subject: str, body: str) -> str:
 
     msg = MIMEMultipart("alternative")
     msg["Subject"] = subject
-    msg["From"] = sender_email
-    msg["To"] = to_email
-
+    msg["From"]    = sender_email
+    msg["To"]      = to_email
     msg.attach(MIMEText(body, "plain"))
-    if not WARMUP_PLAIN_ONLY:
-        msg.attach(
-            MIMEText(
-                (
-                    "<div style='font-family:Arial,sans-serif;font-size:15px;"
-                    "line-height:1.6'>"
-                    f"{body.replace(chr(10), '<br>')}</div>"
-                ),
-                "html",
-            )
-        )
 
     with smtplib.SMTP_SSL("mail.recruitagents.net", 465) as server:
         server.login(sender_email, app_password)
