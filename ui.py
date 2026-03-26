@@ -215,7 +215,36 @@ if not generated:
     st.stop()
 
 st.divider()
-st.markdown("### Preview & Send")
+
+hdr, send_all_col = st.columns([3, 1])
+hdr.markdown("### Preview & Send")
+
+unsent = [p for p in generated if results.get(_key(p), {}).get("status") != "sent"]
+with send_all_col:
+    if st.button(f"Send all ({len(unsent)})", type="primary",
+                 disabled=not unsent, use_container_width=True):
+        prog = st.progress(0)
+        stat = st.empty()
+        failed = 0
+        for i, p in enumerate(unsent):
+            k = _key(p)
+            res = results[k]
+            stat.caption(f"[{i+1}/{len(unsent)}] Sending to {p['first_name']} {p['last_name']}…")
+            prog.progress(int((i + 1) / len(unsent) * 100))
+            try:
+                send_email(p["email"], res["subject"], res["body"])
+                st.session_state.results[k]["status"] = "sent"
+            except Exception as e:
+                st.session_state.results[k]["status"] = "failed"
+                st.session_state.results[k]["error"]  = str(e)
+                failed += 1
+        prog.empty(); stat.empty()
+        sent_n = len(unsent) - failed
+        if failed:
+            st.warning(f"Sent {sent_n}, failed {failed}")
+        else:
+            st.success(f"All {sent_n} emails sent!")
+        st.rerun()
 
 left, right = st.columns([1, 2], gap="large")
 
