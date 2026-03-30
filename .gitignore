@@ -9,6 +9,7 @@
 # Data files
 prospects.csv
 sent_log.csv
+suppression.txt
 
 # Python
 __pycache__/

@@ -1,6 +1,6 @@
 """
 BD Outreach Agent — batch CLI
-Reads prospects.csv → generates emails via OpenAI → pushes to Instantly/Smartlead → logs to sent_log.csv
+Reads prospects.csv → generates emails via OpenAI → sends via SMTP → logs to sent_log.csv
 Run: python agent.py
 """
 
@@ -8,14 +8,19 @@ import csv
 import json
 import os
 import re
+import smtplib
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
 
-import requests
 from dotenv import load_dotenv
-from openai import OpenAI
+from openai import OpenAI, RateLimitError
+
+from core.deliverability import append_unsubscribe_footer, apply_list_unsubscribe_headers, is_suppressed
+from core.prospect_csv import canonicalize_prospect_row
 
 load_dotenv()
 
@@ -24,16 +29,29 @@ load_dotenv()
 OPENAI_API_KEY     = os.environ["OPENAI_API_KEY"]
 MODEL              = os.getenv("OPENAI_MODEL", "gpt-4.1-mini")
 MAX_WORKERS        = int(os.getenv("MAX_WORKERS", "20"))
-LLM_MAX_CONCURRENT = int(os.getenv("LLM_MAX_CONCURRENT", "40"))
+LLM_MAX_CONCURRENT = int(os.getenv("LLM_MAX_CONCURRENT", "5"))
 PROSPECTS_FILE     = os.getenv("PROSPECTS_FILE", "prospects.csv")
 SENT_LOG_FILE      = os.getenv("SENT_LOG_FILE", "sent_log.csv")
 
-# Sending platform — set PLATFORM=instantly or PLATFORM=smartlead in .env
-PLATFORM           = os.getenv("PLATFORM", "instantly")
-INSTANTLY_API_KEY  = os.getenv("INSTANTLY_API_KEY", "")
-INSTANTLY_CAMPAIGN = os.getenv("INSTANTLY_CAMPAIGN_ID", "")
-SMARTLEAD_API_KEY  = os.getenv("SMARTLEAD_API_KEY", "")
-SMARTLEAD_CAMPAIGN = os.getenv("SMARTLEAD_CAMPAIGN_ID", "")
+SMTP_HOST    = os.environ["SMTP_HOST"]
+SMTP_PORT    = int(os.getenv("SMTP_PORT", "465"))
+FROM_NAME    = os.getenv("FROM_NAME", "")
+DAILY_LIMIT  = int(os.getenv("DAILY_LIMIT", "150"))
+
+def _parse_sender_pool() -> list[tuple[str, str]]:
+    raw = os.getenv("SENDER_POOL", "")
+    result = []
+    for entry in raw.split(","):
+        entry = entry.strip()
+        if ":" in entry:
+            email, password = entry.split(":", 1)
+            result.append((email.strip(), password.strip()))
+    return result
+
+_senders      = _parse_sender_pool()
+_sender_idx   = 0
+_sender_counts: dict[str, int] = {}
+_sender_lock  = threading.Lock()
 
 _openai   = OpenAI(api_key=OPENAI_API_KEY)
 _llm_sem  = threading.Semaphore(LLM_MAX_CONCURRENT)
@@ -63,7 +81,7 @@ def _load_sent_emails() -> set[str]:
         return set()
     with open(SENT_LOG_FILE) as f:
         return {
-            row["prospect_email"]
+            row["prospect_email"].strip().lower()
             for row in csv.DictReader(f)
             if row.get("status") == "pushed"
         }
@@ -89,8 +107,8 @@ def _log_row(prospect: dict, subject: str, status: str, error: str = "") -> dict
 # ── Prospects ─────────────────────────────────────────────────────────────────
 
 def _load_prospects() -> list[dict]:
-    with open(PROSPECTS_FILE) as f:
-        return list(csv.DictReader(f))
+    with open(PROSPECTS_FILE, encoding="utf-8", newline="") as f:
+        return [canonicalize_prospect_row(row) for row in csv.DictReader(f)]
 
 # ── Generation ────────────────────────────────────────────────────────────────
 
@@ -124,16 +142,28 @@ Write the email following the playbook exactly. Return JSON only — no markdown
   "body": "..."
 }}"""
 
+    messages = [
+        {"role": "system", "content": MESSAGING_GUIDE},
+        {"role": "user",   "content": prompt},
+    ]
+
     with _llm_sem:
         for attempt in range(2):
-            resp = _openai.chat.completions.create(
-                model=MODEL,
-                max_tokens=1024,
-                messages=[
-                    {"role": "system", "content": MESSAGING_GUIDE},
-                    {"role": "user",   "content": prompt},
-                ],
-            )
+            for rl_attempt in range(5):
+                try:
+                    resp = _openai.chat.completions.create(
+                        model=MODEL,
+                        max_tokens=1024,
+                        messages=messages,
+                    )
+                    break
+                except RateLimitError:
+                    if rl_attempt == 4:
+                        raise
+                    wait = 2 ** rl_attempt
+                    print(f"[rate_limit] sleeping {wait}s before retry {rl_attempt + 1}/4")
+                    time.sleep(wait)
+
             raw = (resp.choices[0].message.content or "").strip()
             if raw:
                 try:
@@ -145,74 +175,56 @@ Write the email following the playbook exactly. Return JSON only — no markdown
 
     raise ValueError("Model returned empty response.")
 
-# ── Platform push ─────────────────────────────────────────────────────────────
+# ── SMTP sending ──────────────────────────────────────────────────────────────
 
-def _api_call(method: str, url: str, **kwargs):
-    backoffs = [5, 15, 45]
-    last_err = None
-    for attempt in range(len(backoffs) + 1):
-        if attempt:
-            time.sleep(backoffs[attempt - 1])
-        try:
-            resp = requests.request(method, url, timeout=30, **kwargs)
-        except requests.ConnectionError as e:
-            last_err = e
-            if attempt == 0:
-                time.sleep(10)
-            continue
-        if resp.status_code in (200, 201):
-            return
-        if resp.status_code == 400:
-            raise ValueError(f"400 Bad Request: {resp.text[:200]}")
-        if resp.status_code == 429:
-            wait = int(resp.headers.get("Retry-After", 60))
-            if attempt < 3:
-                time.sleep(wait)
-                continue
-            raise ValueError(f"429 rate limited after {attempt + 1} retries")
-        if resp.status_code >= 500:
-            last_err = ValueError(f"{resp.status_code}: {resp.text[:200]}")
-            continue
-        resp.raise_for_status()
-    raise last_err or ValueError("API call failed after retries")
+def _next_sender() -> tuple[str, str]:
+    global _sender_idx
+    with _sender_lock:
+        for _ in range(len(_senders)):
+            sender = _senders[_sender_idx % len(_senders)]
+            _sender_idx += 1
+            if _sender_counts.get(sender[0], 0) < DAILY_LIMIT:
+                return sender
+    raise ValueError("Daily send limit reached for all senders")
+
+
+def _sender_first_name(email: str) -> str:
+    local = email.split("@")[0]
+    parts = re.split(r"[._\-]", local)
+    return parts[0].capitalize()
 
 
 def _push(prospect: dict, subject: str, body: str):
-    if PLATFORM == "smartlead":
-        _api_call(
-            "POST", "https://server.smartlead.ai/api/v1/leads",
-            params={"api_key": SMARTLEAD_API_KEY},
-            json={
-                "campaign_id": SMARTLEAD_CAMPAIGN,
-                "lead_list": [{
-                    "email": prospect["email"],
-                    "first_name": prospect["first_name"],
-                    "last_name": prospect["last_name"],
-                    "company_name": prospect.get("company", ""),
-                    "custom_fields": {"custom_subject": subject, "custom_body": body},
-                }],
-            },
-        )
-    else:
-        _api_call(
-            "POST", "https://api.instantly.ai/api/v1/lead/add",
-            json={
-                "api_key": INSTANTLY_API_KEY,
-                "campaign_id": INSTANTLY_CAMPAIGN,
-                "skip_if_in_workspace": True,
-                "leads": [{
-                    "email": prospect["email"],
-                    "first_name": prospect["first_name"],
-                    "last_name": prospect["last_name"],
-                    "company_name": prospect.get("company", ""),
-                    "custom_variables": {"custom_subject": subject, "custom_body": body},
-                }],
-            },
-        )
+    from_email, password = _next_sender()
+    to_email = prospect["email"]
+
+    first_name = _sender_first_name(from_email)
+    body = append_unsubscribe_footer(body.rstrip())
+    body = body + f"\n\n{first_name}"
+
+    msg = MIMEMultipart("alternative")
+    msg["Subject"] = subject
+    msg["From"]    = f"{FROM_NAME} <{from_email}>" if FROM_NAME else from_email
+    msg["To"]      = to_email
+
+    msg.attach(MIMEText(body, "plain"))
+    apply_list_unsubscribe_headers(msg)
+
+    with smtplib.SMTP_SSL(SMTP_HOST, SMTP_PORT) as smtp:
+        smtp.login(from_email, password)
+        smtp.sendmail(from_email, to_email, msg.as_string())
+
+    with _sender_lock:
+        _sender_counts[from_email] = _sender_counts.get(from_email, 0) + 1
 
 # ── Per-prospect pipeline ─────────────────────────────────────────────────────
 
 def _process(prospect: dict) -> dict:
+    if is_suppressed(prospect["email"]):
+        row = _log_row(prospect, "", "skipped_suppressed", "")
+        _append_log(row)
+        return row
+
     try:
         ec = _generate(prospect)
     except Exception as e:
@@ -238,10 +250,13 @@ def main():
     sent = _load_sent_emails()
     all_prospects = _load_prospects()
 
-    pending    = [p for p in all_prospects if p.get("email", "").strip() not in sent]
-    duplicates = [p for p in all_prospects if p.get("email", "").strip() in sent]
+    has_email  = [p for p in all_prospects if p.get("email", "").strip()]
+    no_email   = len(all_prospects) - len(has_email)
+    pending    = [p for p in has_email if p["email"].strip().lower() not in sent]
+    duplicates = [p for p in has_email if p["email"].strip().lower() in sent]
 
-    print(f"Loaded {len(all_prospects)} prospects — {len(duplicates)} already pushed, {len(pending)} to process")
+    print(f"Loaded {len(all_prospects)} prospects — {no_email} skipped (no email), "
+          f"{len(duplicates)} already pushed, {len(pending)} to process")
 
     for p in duplicates:
         _append_log(_log_row(p, "", "skipped_duplicate"))
@@ -258,6 +273,7 @@ def main():
 
     print(
         f"\nDone — pushed: {counts.get('pushed', 0)}, "
+        f"skipped_suppressed: {counts.get('skipped_suppressed', 0)}, "
         f"failed_generation: {counts.get('failed_generation', 0)}, "
         f"failed_api: {counts.get('failed_api', 0)}"
     )

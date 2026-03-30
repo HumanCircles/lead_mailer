@@ -7,6 +7,12 @@ from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
 from dotenv import load_dotenv
 
+from core.deliverability import (
+    append_unsubscribe_footer,
+    apply_list_unsubscribe_headers,
+    is_suppressed,
+)
+
 load_dotenv()
 
 SMTP_HOST   = os.getenv("SMTP_HOST", "mail.recruitagents.net")
@@ -44,13 +50,18 @@ def _next_sender() -> tuple[str, str]:
 
 
 def send_email(to_email: str, subject: str, body: str) -> str:
+    if is_suppressed(to_email):
+        raise ValueError(f"Not sending: address is on suppression list ({to_email.strip().lower()})")
+
     sender_email, app_password = _next_sender()
+    body_out = append_unsubscribe_footer(body)
 
     msg = MIMEMultipart("alternative")
     msg["Subject"] = subject
     msg["From"]    = f"{FROM_NAME} <{sender_email}>"
     msg["To"]      = to_email
-    msg.attach(MIMEText(body, "plain"))
+    msg.attach(MIMEText(body_out, "plain"))
+    apply_list_unsubscribe_headers(msg)
 
     with smtplib.SMTP_SSL(SMTP_HOST, SMTP_PORT) as server:
         server.login(sender_email, app_password)

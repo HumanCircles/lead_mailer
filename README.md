@@ -1,42 +1,24 @@
 # HireQuotient Lead Mailer
 
-AI-powered personalized cold email pipeline. Reads leads from Google Sheets, scrapes LinkedIn via EnrichLayer, drafts hyper-personalized emails using Gemini 2.5 Pro with live Google Search grounding, and sends via Gmail API.
+AI-assisted personalized BD outreach: load prospects from CSV, draft emails with OpenAI using the playbook in `MESSAGING_README.md`, and **send via SMTP** (your own mail host and sender mailboxes). Outbound mail does **not** use Google or the Gmail API.
 
-***
-
-## Folder Structure
+## Folder structure
 
 ```
 lead_mailer/
-├── main.py                  # CLI entry point — runs full pipeline
-├── ui.py                    # Streamlit UI — configure + preview + send
+├── ui.py                 # Streamlit UI — upload CSV, generate, preview, send
+├── agent.py              # Batch CLI — prospects CSV → OpenAI → SMTP → sent_log.csv
 ├── requirements.txt
-├── .env                     # API keys (copy from env.example)
-├── env.example              # Environment variable template
-├── service_account.json     # Google Sheets service account key
-├── gmail_credentials.json   # Gmail OAuth2 client credentials
-├── gmail_token.json         # Auto-created on first run (Gmail session)
+├── .env                  # API keys and SMTP (copy from .env.example)
+├── .env.example
+├── MESSAGING_README.md   # Voice and structure rules for drafts
+├── suppression.txt.example
 └── core/
-    ├── sheets_reader.py     # Reads leads + marks rows as SENT
-    ├── linkedin_scraper.py  # EnrichLayer People API — LinkedIn profiles
-    ├── email_drafter.py     # Gemini 2.5 Pro + Google Search grounding
-    └── gmail_sender.py      # Gmail API sender (OAuth2)
+    ├── prospect_csv.py   # Normalise ATS-style or simple CSV columns
+    ├── email_drafter.py  # OpenAI drafting from the playbook
+    ├── smtp_sender.py    # SMTP send (rotating sender pool, throttling)
+    └── deliverability.py # Suppression list, unsubscribe footer, List-Unsubscribe headers
 ```
-
-***
-
-## Google Sheet Format
-
-Create a sheet with exactly these column headers (case-sensitive):
-
-| Name | Email | LinkedIn URL | Status |
-|------|-------|--------------|--------|
-| John Doe | john@acme.com | https://linkedin.com/in/johndoe | |
-
-- **Status** column is auto-updated to `SENT` by the script — re-runs are safe, already-sent rows are skipped.
-- Share the sheet with the service account email: `hirequotient-lead-mailer@hq-sourcing-stag.iam.gserviceaccount.com` (Editor access)
-
-***
 
 ## Setup
 
@@ -48,70 +30,46 @@ pip install -r requirements.txt
 
 ### 2. Configure environment
 
-Copy `env.example` to `.env` and fill in:
+Copy `.env.example` to `.env` and set:
 
-```env
-GEMINI_API_KEY=              # aistudio.google.com → Get API Key
-ENRICHLAYER_API_KEY=         # enrichlayer.com/dashboard → Bearer token
-SENDER_EMAIL=                # Gmail address to send from
-ENRICHLAYER_FRESH_DATA=true  # true = fresh data (+1 credit), false = cached (free)
+- **`OPENAI_API_KEY`** — required for drafting.
+- **`SENDER_POOL`** — comma-separated `email:password` pairs for mailboxes on your SMTP host.
+- **`SMTP_HOST`** / **`SMTP_PORT`** — your provider’s SMTP endpoint (e.g. `mail.yourdomain.com` and `465` for SSL).
 
-# Credential file paths (leave as-is if using defaults)
-GOOGLE_SERVICE_ACCOUNT_JSON=service_account.json
-GMAIL_OAUTH_CREDENTIALS=gmail_credentials.json
-GMAIL_TOKEN_FILE=gmail_token.json
-```
+Optional: `FROM_NAME`, `DAILY_LIMIT`, deliverability variables (`SUPPRESSION_FILE`, `UNSUBSCRIBE_MAILTO`, `UNSUBSCRIBE_FOOTER_ENABLED`, `UNSUBSCRIBE_URL`).
+
+### 3. Suppression list (optional)
+
+Copy `suppression.txt.example` to `suppression.txt` and add one email per line (addresses that must never receive mail). `suppression.txt` is gitignored by default.
 
 ## Running
 
-### Option A — Streamlit UI (recommended)
+### Streamlit UI
 
 ```bash
 streamlit run ui.py
 ```
 
-- Set Google Sheet ID or full URL and tab name (the UI will auto-extract the ID from a full URL)
-- Toggle fresh vs cached EnrichLayer data
-- Preview each drafted email before sending
-- Send individually with one click
+Upload a CSV, generate drafts, edit if needed, send individually or in bulk.
 
-### Option B — CLI (bulk send)
+### Batch agent (CLI)
 
 ```bash
-python main.py
+python agent.py
 ```
 
-Processes all pending leads automatically, marks each row SENT, prints a summary table.
+Reads `prospects.csv` (or `PROSPECTS_FILE`), skips already-logged sends, respects suppression, appends to `sent_log.csv`.
 
-> **First run only:** A browser tab opens for Gmail OAuth consent — click Allow. Token is saved to `gmail_token.json` for all future runs.
-
-***
-
-## How It Works
+## How it works
 
 ```
-Google Sheet
-    ↓  (gspread + service account)
-EnrichLayer API  →  LinkedIn profile data
-    ↓  (name, headline, role, skills, education)
-Gemini 2.5 Pro + Google Search Grounding
-    ↓  (researches person/company live, drafts personalized email)
-Gmail API
-    ↓  (sends from SENDER_EMAIL)
-Google Sheet  ←  Status marked SENT
+CSV prospects
+    ↓
+OpenAI (playbook from MESSAGING_README.md)
+    ↓
+SMTP (rotating pool, daily limits, optional footer + List-Unsubscribe)
 ```
 
-***
+## Cost
 
-## Cost Per Email
-
-| Component | Cost |
-|-----------|------|
-| EnrichLayer LinkedIn scrape (`if-recent`) | ~$0.020 |
-| Gemini 2.5 Pro + Search Grounding | ~$0.037 |
-| Gmail API | Free |
-| **Total** | **~$0.057 / email** |
-
-Switch `ENRICHLAYER_FRESH_DATA=false` to use cached profiles and save ~$0.010/email.
-
-***
+Drafting cost depends on your OpenAI model and usage; **SMTP sending** is through your own provider (no Gmail API or OAuth in this path).

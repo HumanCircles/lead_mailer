@@ -1,6 +1,14 @@
 # BD Outreach Messaging Playbook
 
-A plug-and-play messaging guide for cold BD outreach. Works across any company or domain. The only customization required per prospect is research — there is no identity block to configure.
+A plug-and-play messaging guide for cold BD outreach. Works across any company or domain. The only customization required per prospect is research. There is no identity block to configure.
+
+---
+
+## CRITICAL WRITING RULES — READ BEFORE ANYTHING ELSE
+
+**Never use dashes of any kind in the email body.** No em dashes (—), no double hyphens (--), no en dashes (–). They are an immediate signal of AI-generated text. Use a period or rewrite the sentence instead.
+
+**Never add a sign-off or signature.** The signature is appended automatically. Do not write "Best," or any closing.
 
 ---
 
@@ -15,21 +23,21 @@ The goal of each email is one thing: **get a discussion on the calendar.**
 ## 2. Email Structure — The Five Beats
 
 ### Beat 1 — The Observation (1 sentence)
-Open with something you genuinely saw, read, or noticed about the recipient. A post they wrote, a talk they gave, a comment in an interview, a product decision their company made. This is not a compliment — it is proof of attention.
+Open with something you genuinely saw, read, or noticed about the recipient. A post they wrote, a talk they gave, a comment in an interview, a product decision their company made. This is not a compliment. It is proof of attention.
 
 ```
 "I came across your note on [platform/forum] about [specific topic] and it stayed with me."
-"I saw your session at [conference] on [topic] — the point about [specific thing they said] was something our team has been sitting with."
-"I read your piece on [publication] about [topic] — the framing around [specific argument] is exactly the tension we see inside [their industry]."
+"I saw your session at [conference] on [topic]. The point about [specific thing they said] was something our team has been sitting with."
+"I read your piece on [publication] about [topic]. The framing around [specific argument] is exactly the tension we see inside [their industry]."
 ```
 
 The observation must be real and specific. A generic opener ("I've been following your work") is worse than no opener at all.
 
 ### Beat 2 — The Insider Gap (2-3 sentences)
-Move from the observation into the specific problem their company or platform has. Name the product line, the segment, the failure mode. Use insider language — the term they use internally, not the term a vendor would use. This should make them pause and think "how do they know that?"
+Move from the observation into the specific problem their company or platform has. Name the product line, the segment, the failure mode. Use insider language: the term they use internally, not the term a vendor would use. This should make them pause and think "how do they know that?"
 
 ```
-"What that [note/session/piece] pointed at, without naming it directly, is the gap [their platform/product] has not closed in [specific domain]. [Specific segment of their customers] is solving it outside the platform today — and the cost of that is not just churn, it is lost data, lost workflow, and a competitor integration that becomes sticky."
+"What that [note/session/piece] pointed at, without naming it directly, is the gap [their platform/product] has not closed in [specific domain]. [Specific segment of their customers] is solving it outside the platform today. The cost of that is not just churn. It is lost data, lost workflow, and a competitor integration that becomes sticky."
 ```
 
 Do not soften this. The gap must be stated plainly.
@@ -38,7 +46,7 @@ Do not soften this. The gap must be stated plainly.
 Introduce what you do in the context of the gap you just named. Do not describe features. Describe what changes for them if this exists. Frame it as something that belongs inside their ecosystem, not alongside it.
 
 ```
-"What we have built addresses exactly this layer — [one-line description of the outcome, not the product]. It is designed to operate as a native workflow inside platforms like [their platform], not as a bolt-on that their customers have to manage separately."
+"What we have built addresses exactly this layer: [one-line description of the outcome, not the product]. It is designed to operate as a native workflow inside platforms like [their platform], not as a bolt-on that their customers have to manage separately."
 ```
 
 ### Beat 4 — The FOMO Signal (1-2 sentences)
@@ -51,10 +59,10 @@ Reference traction with leading firms in the recipient's industry without naming
 Do not fabricate this. If traction is early, reframe around a pilot, a proof of concept, or the direction the category is moving.
 
 ### Beat 5 — The Ask (2-3 sentences)
-Close with a direct invitation for a discussion. Frame it as the CEO and sender together — this signals the conversation is worth senior time on both sides. Do not hedge. Do not say "happy to share more" or "let me know if this is relevant."
+Close with a direct invitation for a discussion. Frame it as the CEO and sender together. This signals the conversation is worth senior time on both sides. Do not hedge. Do not say "happy to share more" or "let me know if this is relevant."
 
 ```
-"I and our CEO would like to invite you for a discussion to explore whether there is a fit worth taking forward. Not a pitch — a conversation between people thinking about the same problem from different sides. Would [specific day range] work for a 20-minute call?"
+"I and our CEO would like to invite you for a discussion to explore whether there is a fit worth taking forward. Not a pitch. A conversation between people thinking about the same problem from different sides. Would [specific day range] work for a 20-minute call?"
 ```
 
 ---
@@ -76,7 +84,7 @@ Invite for discussion | agent layer for Flex Credit utility
 ```
 
 **Rules:**
-- Always start with "Invite for discussion |" — it is direct and signals peer-level intent
+- Always start with "Invite for discussion |". It is direct and signals peer-level intent.
 - The hook is 3-4 words, no more
 - Name the problem domain, not your product
 - No question marks, exclamation points, or personalization tokens in the subject line
@@ -95,6 +103,8 @@ Let traction speak briefly               Over-explain the traction
 Ask for a specific discussion            Ask if they are "open to connecting"
 Use the word "discussion" not "call"     Use "demo", "pitch", or "intro"
 Plain text only                          Use bullet points, bold, or formatting in the body
+Use periods to break sentences           Use dashes of any kind (they read as AI-generated)
+Omit any sign-off or closing             Add "Best," or any signature (added automatically)
 ```
 
 ---
@@ -110,7 +120,7 @@ Write it this way:
 
 Or if advisors carry weight by affiliation alone:
 ```
-"Our advisors include senior operators from firms that have built and scaled [relevant category] globally — which is part of why this conversation feels different from most BD conversations in this space."
+"Our advisors include senior operators from firms that have built and scaled [relevant category] globally, which is part of why this conversation feels different from most BD conversations in this space."
 ```
 
 Never name-drop. Never quote. The quality of the discussion itself will establish credibility faster than any credential listed in an email.

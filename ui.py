@@ -8,8 +8,10 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+from core.deliverability import is_suppressed
 from core.email_drafter import draft_email
-from core.gmail_sender  import send_email
+from core.smtp_sender import send_email
+from core.prospect_csv import normalise_prospects_dataframe
 
 # ── Page config ───────────────────────────────────────────────────────────────
 
@@ -49,7 +51,7 @@ def _validate(df: pd.DataFrame) -> list[str]:
     return [f"Missing column: `{c}`" for c in sorted(REQUIRED_COLS - cols)]
 
 def _normalise(df: pd.DataFrame) -> pd.DataFrame:
-    df.columns = [c.lower().strip() for c in df.columns]
+    df = normalise_prospects_dataframe(df)
     for c in OPTIONAL_COLS:
         if c not in df.columns:
             df[c] = ""
@@ -71,6 +73,11 @@ def _to_csv(prospects: list[dict], results: dict) -> bytes:
 def _icon(status: str) -> str:
     return {"done": "🟢", "sent": "✅", "failed": "🔴", "sending": "🟡"}.get(status, "⚪")
 
+def _row_icon(p: dict, results: dict) -> str:
+    if is_suppressed(p.get("email", "")):
+        return "🚫"
+    return _icon(results.get(_key(p), {}).get("status", "pending"))
+
 # ── Sidebar — status only ─────────────────────────────────────────────────────
 
 with st.sidebar:
@@ -81,11 +88,14 @@ with st.sidebar:
     oai_ok     = "✅" if os.getenv("OPENAI_API_KEY","").startswith("sk-") else "❌ missing"
     pool_count = len([e for e in os.getenv("SENDER_POOL","").split(",") if ":" in e])
     pool_ok    = f"✅ {pool_count} senders" if pool_count else "❌ missing"
+    n_supp     = sum(1 for p in st.session_state.prospects if is_suppressed(p.get("email", "")))
 
     st.markdown(f"**OpenAI key:** {oai_ok}")
     st.markdown(f"**Sender pool:** {pool_ok}")
     st.markdown(f"**Model:** `{os.getenv('OPENAI_MODEL','gpt-4.1-mini')}`")
     st.markdown(f"**SMTP:** `{os.getenv('SMTP_HOST','mail.recruitagents.net')}`")
+    if n_supp:
+        st.caption(f"{n_supp} address(es) on suppression list (send disabled)")
     st.caption("Edit `.env` to change settings")
     st.divider()
 
@@ -111,7 +121,10 @@ st.divider()
 # ── Step 1: Upload ────────────────────────────────────────────────────────────
 
 with st.expander("**Step 1 — Upload prospects CSV**", expanded=not bool(st.session_state.prospects)):
-    st.caption("Required: `first_name` `last_name` `email` `company` `title`  ·  Optional: `hcm_platform`")
+    st.caption(
+        "Required: `first_name` `last_name` `email` `company` `title` (or ATS-style "
+        "`First Name` … `Email` … `Company Name` … `Title`)  ·  Optional: `hcm_platform`"
+    )
     uploaded = st.file_uploader("CSV file", type=["csv"], label_visibility="collapsed")
     if uploaded:
         try:
@@ -149,7 +162,7 @@ st.dataframe(
         "Email":   p["email"],
         "Company": p["company"],
         "Title":   p["title"],
-        "":        _icon(results.get(_key(p), {}).get("status", "pending")),
+        "":        _row_icon(p, results),
     } for i, p in enumerate(prospects)]),
     width="stretch",
     hide_index=True,
@@ -206,7 +219,10 @@ st.divider()
 hdr_col, send_all_col = st.columns([3, 1])
 hdr_col.markdown("### Preview & Send")
 
-unsent = [p for p in generated if results.get(_key(p), {}).get("status") != "sent"]
+unsent = [
+    p for p in generated
+    if results.get(_key(p), {}).get("status") != "sent" and not is_suppressed(p.get("email", ""))
+]
 with send_all_col:
     if st.button(f"Send all ({len(unsent)})", type="primary",
                  disabled=not unsent, width="stretch"):
@@ -238,7 +254,7 @@ with left:
         k      = _key(p)
         status = results[k].get("status", "done")
         name   = f"{p['first_name']} {p['last_name']}"
-        if st.button(f"{_icon(status)} **{name}**  \n{p['company']}",
+        if st.button(f"{_row_icon(p, results)} **{name}**  \n{p['company']}",
                      key=f"sel_{i}", width="stretch",
                      type="primary" if st.session_state.sel == i else "secondary"):
             st.session_state.sel = i
@@ -285,7 +301,9 @@ with right:
                     st.error(str(e))
             st.rerun()
     with btn3:
-        if status != "sent":
+        if is_suppressed(p["email"]):
+            st.caption("Send disabled (suppression list)")
+        elif status != "sent":
             if st.button("Send ✉️", type="primary", width="stretch", key=f"send_{k}"):
                 with st.spinner("Sending…"):
                     try:

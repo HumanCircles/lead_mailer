@@ -1,0 +1,4 @@
+# One email address per line (lowercase recommended). Lines starting with # are ignored.
+# Copy this file to suppression.txt and add opt-outs or bounced addresses.
+
+# opted-out@example.com
