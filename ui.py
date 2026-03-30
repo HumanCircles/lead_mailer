@@ -71,23 +71,23 @@ def _to_csv(prospects: list[dict], results: dict) -> bytes:
     return buf.getvalue().encode()
 
 def _icon(status: str) -> str:
-    return {"done": "🟢", "sent": "✅", "failed": "🔴", "sending": "🟡"}.get(status, "⚪")
+    return {"done": "DONE", "sent": "SENT", "failed": "FAILED", "sending": "SENDING"}.get(status, "PENDING")
 
 def _row_icon(p: dict, results: dict) -> str:
     if is_suppressed(p.get("email", "")):
-        return "🚫"
+        return "SUPPRESSED"
     return _icon(results.get(_key(p), {}).get("status", "pending"))
 
 # ── Sidebar — status only ─────────────────────────────────────────────────────
 
 with st.sidebar:
-    st.markdown("## ✉️ BD Outreach")
+    st.markdown("## BD Outreach")
     st.caption("CSV → OpenAI → SMTP")
     st.divider()
 
-    oai_ok     = "✅" if os.getenv("OPENAI_API_KEY","").startswith("sk-") else "❌ missing"
+    oai_ok     = "configured" if os.getenv("OPENAI_API_KEY","").startswith("sk-") else "missing"
     pool_count = len([e for e in os.getenv("SENDER_POOL","").split(",") if ":" in e])
-    pool_ok    = f"✅ {pool_count} senders" if pool_count else "❌ missing"
+    pool_ok    = f"{pool_count} senders configured" if pool_count else "missing"
     n_supp     = sum(1 for p in st.session_state.prospects if is_suppressed(p.get("email", "")))
 
     st.markdown(f"**OpenAI key:** {oai_ok}")
@@ -203,7 +203,7 @@ with col_gen:
 
 with col_dl:
     if n_done:
-        st.download_button("⬇ Download CSV", data=_to_csv(prospects, results),
+        st.download_button("Download CSV", data=_to_csv(prospects, results),
                            file_name="outreach_emails.csv", mime="text/csv",
                            width="stretch")
 
@@ -272,7 +272,7 @@ with right:
     st.markdown(f"#### {name}  {_icon(status)}")
     st.caption(f"{p['title']} · {p['company']}" +
                (f" · {p['hcm_platform']}" if p.get("hcm_platform") else ""))
-    st.caption(f"📧 {p['email']}")
+    st.caption(f"Email: {p['email']}")
     st.divider()
 
     subj = st.text_input("Subject", value=res.get("subject", ""), key=f"s_{k}")
@@ -285,7 +285,7 @@ with right:
     btn1, btn2, btn3 = st.columns(3)
 
     with btn1:
-        st.download_button("⬇ .txt", data=f"Subject: {subj}\n\n{body}".encode(),
+        st.download_button("Download .txt", data=f"Subject: {subj}\n\n{body}".encode(),
                            file_name=f"{name.replace(' ','_')}.txt",
                            width="stretch")
     with btn2:
@@ -304,7 +304,7 @@ with right:
         if is_suppressed(p["email"]):
             st.caption("Send disabled (suppression list)")
         elif status != "sent":
-            if st.button("Send ✉️", type="primary", width="stretch", key=f"send_{k}"):
+            if st.button("Send", type="primary", width="stretch", key=f"send_{k}"):
                 with st.spinner("Sending…"):
                     try:
                         from_addr = send_email(p["email"], subj, body)
@@ -316,7 +316,7 @@ with right:
                         st.error(str(e))
                 st.rerun()
         else:
-            st.success("Sent ✅")
+            st.success("Sent")
 
     if res.get("error"):
         st.error(res["error"])
