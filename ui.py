@@ -178,7 +178,7 @@ pending = [p for p in prospects if results.get(_key(p), {}).get("status") not in
 col_gen, col_dl = st.columns([3, 1])
 with col_gen:
     if st.button(
-        f"Generate all  ({len(pending)} pending)" if pending else "✅ All generated",
+        f"Generate all  ({len(pending)} pending)" if pending else "All generated",
         type="primary", disabled=not pending, width="stretch",
     ):
         prog = st.progress(0)
