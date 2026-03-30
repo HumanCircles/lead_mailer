@@ -17,7 +17,7 @@ from core.prospect_csv import normalise_prospects_dataframe
 
 st.set_page_config(
     page_title="BD Outreach",
-    page_icon="✉️",
+    page_icon="",
     layout="wide",
     initial_sidebar_state="collapsed",
 )
