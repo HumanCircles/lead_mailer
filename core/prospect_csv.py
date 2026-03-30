@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
-import pandas as pd
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    import pandas as pd
 
 
 def _merge_row_keys_casefold(row: dict) -> dict[str, object]:
@@ -44,8 +47,10 @@ def _dedupe_column_names(names: list[str]) -> list[str]:
     return out
 
 
-def normalise_prospects_dataframe(df: pd.DataFrame) -> pd.DataFrame:
+def normalise_prospects_dataframe(df: "pd.DataFrame") -> "pd.DataFrame":
     """Build a dataframe with canonical columns from simple or ATS-style exports."""
+    import pandas as pd
+
     df = df.copy()
     lower = [str(c).lower().strip() for c in df.columns]
     df.columns = _dedupe_column_names(lower)

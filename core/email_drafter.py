@@ -4,14 +4,23 @@ import json
 from openai import OpenAI
 from dotenv import load_dotenv
 
+from core.deliverability import strip_control_chars
+
 load_dotenv()
 
-_client = OpenAI(api_key=os.environ["OPENAI_API_KEY"])
+OPENAI_TIMEOUT     = float(os.getenv("OPENAI_TIMEOUT", "30"))
+OPENAI_MAX_RETRIES = int(os.getenv("OPENAI_MAX_RETRIES", "2"))
+
+_client = OpenAI(
+    api_key=os.environ["OPENAI_API_KEY"],
+    timeout=OPENAI_TIMEOUT,
+    max_retries=OPENAI_MAX_RETRIES,
+)
 MODEL   = os.getenv("OPENAI_MODEL", "gpt-4.1-mini")
 
 _GUIDE_PATH = os.path.join(os.path.dirname(os.path.dirname(__file__)), "MESSAGING_README.md")
-with open(_GUIDE_PATH) as _f:
-    MESSAGING_GUIDE = _f.read()
+with open(_GUIDE_PATH, encoding="utf-8") as _f:
+    MESSAGING_GUIDE = strip_control_chars(_f.read())
 
 
 def _parse_json(raw: str) -> dict:
@@ -27,10 +36,10 @@ def _parse_json(raw: str) -> dict:
 
 
 def draft_email(lead_data: dict) -> dict:
-    name     = lead_data.get("name", "")
-    company  = lead_data.get("company", "")
-    title    = lead_data.get("title", "")
-    platform = lead_data.get("hcm_platform", "") or company
+    name     = strip_control_chars(str(lead_data.get("name", "") or ""))
+    company  = strip_control_chars(str(lead_data.get("company", "") or ""))
+    title    = strip_control_chars(str(lead_data.get("title", "") or ""))
+    platform = strip_control_chars(str(lead_data.get("hcm_platform", "") or company or ""))
 
     prompt = f"""Prospect:
 - Name: {name}

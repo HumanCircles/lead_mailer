@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import os
+import re
 from email.message import Message
+from email.utils import formataddr
 from urllib.parse import quote
 
 from dotenv import load_dotenv
@@ -40,6 +42,31 @@ def is_suppressed(email: str) -> bool:
     if not e:
         return False
     return e in get_suppression_set()
+
+
+def strip_control_chars(s: str) -> str:
+    """Strip NUL and other C0 controls that can break JSON bodies for LLM/API requests."""
+    if not s:
+        return ""
+    return "".join(c for c in s if ord(c) >= 32 or c in "\n\r\t")
+
+
+def _display_name_from_email(sender_email: str) -> str:
+    local = sender_email.strip().split("@", 1)[0]
+    parts = re.split(r"[._\-]", local)
+    base = parts[0] if parts and parts[0] else local
+    if not base:
+        return "Sender"
+    return base[:1].upper() + base[1:].lower()
+
+
+def smtp_from_header(display_name: str | None, sender_email: str) -> str:
+    """RFC 5322 From value. Never emits a malformed ` <addr>` when display name is empty."""
+    addr = sender_email.strip()
+    name = (display_name or "").strip()
+    if not name:
+        name = _display_name_from_email(addr)
+    return formataddr((name, addr))
 
 
 def append_unsubscribe_footer(body: str) -> str:
