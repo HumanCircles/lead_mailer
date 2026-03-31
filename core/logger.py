@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import logging
 import os
+import threading
 from logging.handlers import TimedRotatingFileHandler
 from zoneinfo import ZoneInfo
 
@@ -36,12 +37,11 @@ _LOG_FILE = os.path.join(_LOG_DIR, "agent.log")
 
 _LOGGER_NAME = "lead_mailer"
 _logger: logging.Logger | None = None
+_lock = threading.Lock()
 
 
 class _ISTFormatter(logging.Formatter):
     """Logging formatter that stamps every record with IST local time."""
-
-    converter = None  # disable the default UTC/local converter
 
     def formatTime(self, record: logging.LogRecord, datefmt: str | None = None) -> str:  # noqa: N802
         import datetime
@@ -64,11 +64,14 @@ def get_logger() -> logging.Logger:
     calls return the cached instance without reconfiguring it.
     """
     global _logger
-    if _logger is not None:
+    if _logger is not None:          # fast path — no lock needed
         return _logger
+    with _lock:                      # slow path — double-checked locking
+        if _logger is not None:
+            return _logger
 
-    # Ensure the logs directory exists.
-    os.makedirs(_LOG_DIR, exist_ok=True)
+        # Ensure the logs directory exists.
+        os.makedirs(_LOG_DIR, exist_ok=True)
 
     logger = logging.getLogger(_LOGGER_NAME)
     logger.setLevel(logging.DEBUG)
