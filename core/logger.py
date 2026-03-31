@@ -10,7 +10,7 @@ Usage
 The logger is a module-level singleton; every call to ``get_logger()``
 returns the same :class:`logging.Logger` instance.
 
-Rotation happens at midnight IST; up to 30 daily backup files are kept.
+Rotation happens at midnight IST; backup count is controlled by LOG_KEEP_DAYS (default 7).
 All timestamps written to the file use IST (UTC+5:30).
 """
 
@@ -83,12 +83,13 @@ def get_logger() -> logging.Logger:
         datefmt="%Y-%m-%d %H:%M:%S %Z",
     )
 
-    # --- File handler: midnight-IST rotation, keep 30 days ---
+    # --- File handler: midnight-IST rotation ---
+    _keep_days = int(os.environ.get("LOG_KEEP_DAYS", "7"))
     file_handler = TimedRotatingFileHandler(
         filename=_LOG_FILE,
         when="midnight",
         interval=1,
-        backupCount=30,
+        backupCount=_keep_days,
         encoding="utf-8",
         utc=False,          # rotate at local midnight; we'll keep the process TZ as IST
         atTime=None,
@@ -108,7 +109,7 @@ def get_logger() -> logging.Logger:
     # --- Console handler ---
     console_handler = logging.StreamHandler()
     console_handler.setFormatter(fmt)
-    console_handler.setLevel(logging.INFO)
+    console_handler.setLevel(logging.WARNING)
 
     logger.addHandler(file_handler)
     logger.addHandler(console_handler)
