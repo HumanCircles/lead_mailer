@@ -137,6 +137,7 @@ def _next_sender() -> tuple[str, str]:
             hourly_ok = state["hourly"] < (HOURLY_LIMIT - HOURLY_BUFFER)
 
             if daily_ok and hourly_ok:
+                state["hourly"] += 1  # reserve slot now — prevents concurrent over-selection
                 return email, pwd
 
         raise RuntimeError("All sender accounts have hit the daily or hourly limit.")
@@ -207,11 +208,27 @@ def _hourly_safe_limit() -> int:
 # Core delivery
 # ---------------------------------------------------------------------------
 
+_SMTP_HOST_MAP = {
+    "superchargedai.org": "gvam1039.siteground.biz",
+    # recruitagents.net → mail.recruitagents.net (default derivation, no override needed)
+}
+
+
+def _smtp_host_for(email: str) -> str:
+    """Derive SMTP host from sender email domain, using explicit overrides where needed."""
+    try:
+        domain = email.split("@", 1)[1]
+        return _SMTP_HOST_MAP.get(domain, f"mail.{domain}")
+    except IndexError:
+        return SMTP_HOST
+
+
 def smtp_deliver(from_email: str, password: str, to_email: str, msg_as_string: str) -> None:
     """Connect, login, send with socket timeout and retries (transient SMTP / network errors)."""
+    host = _smtp_host_for(from_email)
     for attempt in range(SMTP_MAX_RETRIES):
         try:
-            with smtplib.SMTP_SSL(SMTP_HOST, SMTP_PORT, timeout=SMTP_TIMEOUT) as server:
+            with smtplib.SMTP_SSL(host, SMTP_PORT, timeout=SMTP_TIMEOUT) as server:
                 server.login(from_email, password)
                 server.sendmail(from_email, to_email, msg_as_string)
             return
@@ -285,8 +302,8 @@ def send_email(to_email: str, subject: str, body: str, recipient_first_name: str
             raise
 
         with _pool_lock:
-            _sender_state[sender_email]["daily"]  += 1
-            _sender_state[sender_email]["hourly"] += 1
+            _sender_state[sender_email]["daily"] += 1
+            # hourly already incremented in _next_sender() at selection time
 
         if SEND_DELAY_SECONDS > 0:
             time.sleep(SEND_DELAY_SECONDS)
