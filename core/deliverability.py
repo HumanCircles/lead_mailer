@@ -37,6 +37,13 @@ def get_suppression_set() -> frozenset[str]:
     return _suppression_set
 
 
+def reload_suppression() -> int:
+    """Force reload of suppression list from disk. Returns count of suppressed addresses."""
+    global _suppression_set
+    _suppression_set = frozenset(load_suppression_set())
+    return len(_suppression_set)
+
+
 def is_suppressed(email: str) -> bool:
     e = email.strip().lower()
     if not e:
