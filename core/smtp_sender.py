@@ -68,34 +68,56 @@ _sender_state: dict[str, dict] = {
 
 
 def _hydrate_counters_from_sent_log() -> None:
-    """Restore today's per-sender pushed counts so Streamlit restarts respect DAILY_LIMIT."""
+    """Restore today's per-sender pushed counts (daily + hourly) from sent_log.csv.
+
+    Called once at module import so Streamlit restarts and process restarts respect
+    both DAILY_LIMIT and HOURLY_LIMIT without waiting for the first lockout.
+    """
     if not os.path.isfile(SENT_LOG_FILE):
         return
+    now = time.time()
     today_utc = datetime.now(timezone.utc).date().isoformat()
-    loaded: dict[str, int] = {}
-    with open(SENT_LOG_FILE, newline="", encoding="utf-8") as f:
-        reader = csv.DictReader(f)
-        if not reader.fieldnames or "from_email" not in reader.fieldnames:
-            return
-        for row in reader:
-            if row.get("status") != "pushed":
-                continue
-            ts = row.get("timestamp") or ""
-            if not ts.startswith(today_utc):
-                continue
-            fe = (row.get("from_email") or "").strip().lower()
-            if not fe:
-                continue
-            loaded[fe] = loaded.get(fe, 0) + 1
+    hour_start_utc = now - (now % 3600)  # top of the current UTC hour (epoch)
+
+    daily:  dict[str, int] = {}
+    hourly: dict[str, int] = {}
+
+    try:
+        with open(SENT_LOG_FILE, newline="", encoding="utf-8") as f:
+            reader = csv.DictReader(f)
+            if not reader.fieldnames or "from_email" not in reader.fieldnames:
+                return
+            for row in reader:
+                if row.get("status") != "pushed":
+                    continue
+                ts = row.get("timestamp") or ""
+                if not ts.startswith(today_utc):
+                    continue
+                fe = (row.get("from_email") or "").strip().lower()
+                if not fe:
+                    continue
+                daily[fe] = daily.get(fe, 0) + 1
+                try:
+                    sent_epoch = datetime.fromisoformat(
+                        ts.replace("Z", "+00:00")
+                    ).timestamp()
+                    if sent_epoch >= hour_start_utc:
+                        hourly[fe] = hourly.get(fe, 0) + 1
+                except ValueError:
+                    pass
+    except Exception as e:
+        log.warning("Could not hydrate sender state from log: %s", e)
+        return
+
     with _pool_lock:
         for pool_email in _sender_state:
-            _sender_state[pool_email]["daily"] = loaded.get(pool_email.lower(), 0)
+            key = pool_email.lower()
+            _sender_state[pool_email]["daily"]      = daily.get(key, 0)
+            _sender_state[pool_email]["hourly"]     = hourly.get(key, 0)
+            _sender_state[pool_email]["hour_start"] = hour_start_utc
 
 
 _hydrate_counters_from_sent_log()
-
-# Keep _counters as a compatibility shim pointing into _sender_state
-_counters: dict[str, int] = {e: _sender_state[e]["daily"] for e, _ in _pool}
 
 
 def _next_sender() -> tuple[str, str]:
@@ -225,31 +247,51 @@ def _ensure_recipient_greeting(body: str, recipient_first_name: str) -> str:
 
 
 def send_email(to_email: str, subject: str, body: str, recipient_first_name: str = "") -> str:
+    """Send one email. Returns the sender address used. Raises on unrecoverable failure.
+
+    On a SiteGround hourly lockout, marks the sender at-limit and retries with the
+    next available sender (up to len(_pool) attempts) before raising.
+    """
     if is_suppressed(to_email):
         raise ValueError(f"Not sending: address is on suppression list ({to_email.strip().lower()})")
 
-    sender_email, app_password = _next_sender()
     body_out = _ensure_recipient_greeting(body, recipient_first_name)
-    body_out = append_signature_block(body_out, sender_email=sender_email)
-    body_out = append_unsubscribe_footer(body_out)
 
-    msg = MIMEMultipart("alternative")
-    msg["Subject"] = subject
-    msg["From"]    = smtp_from_header(FROM_DISPLAY, sender_email)
-    msg["To"]      = to_email
-    msg["Date"]    = formatdate(localtime=True)
-    msg.attach(MIMEText(body_out, "plain"))
-    apply_list_unsubscribe_headers(msg)
+    last_exc: Exception | None = None
+    for _attempt in range(len(_pool)):
+        sender_email, app_password = _next_sender()
 
-    smtp_deliver(sender_email, app_password, to_email, msg.as_string())
+        body_with_sig = append_signature_block(body_out, sender_email=sender_email)
+        body_with_sig = append_unsubscribe_footer(body_with_sig)
 
-    with _pool_lock:
-        _sender_state[sender_email]["daily"]  += 1
-        _sender_state[sender_email]["hourly"] += 1
-        # Keep legacy _counters shim in sync
-        _counters[sender_email] = _sender_state[sender_email]["daily"]
+        msg = MIMEMultipart("alternative")
+        msg["Subject"] = subject
+        msg["From"]    = smtp_from_header(FROM_DISPLAY, sender_email)
+        msg["To"]      = to_email
+        msg["Date"]    = formatdate(localtime=True)
+        msg.attach(MIMEText(body_with_sig, "plain"))
+        apply_list_unsubscribe_headers(msg)
 
-    if SEND_DELAY_SECONDS > 0:
-        time.sleep(SEND_DELAY_SECONDS)
+        try:
+            smtp_deliver(sender_email, app_password, to_email, msg.as_string())
+        except Exception as e:
+            last_exc = e
+            if is_siteground_hourly_lockout(e):
+                # Mark this sender as at-limit so _next_sender() skips it
+                with _pool_lock:
+                    _sender_state[sender_email]["hourly"] = HOURLY_LIMIT
+                log.warning("Lockout on %s — trying next sender", sender_email)
+                continue
+            raise
 
-    return sender_email
+        with _pool_lock:
+            _sender_state[sender_email]["daily"]  += 1
+            _sender_state[sender_email]["hourly"] += 1
+
+        if SEND_DELAY_SECONDS > 0:
+            time.sleep(SEND_DELAY_SECONDS)
+
+        log.info("pushed to=%s from=%s", to_email, sender_email)
+        return sender_email
+
+    raise last_exc or RuntimeError("All senders exhausted")
