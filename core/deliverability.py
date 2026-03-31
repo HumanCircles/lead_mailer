@@ -99,14 +99,9 @@ def append_signature_block(body: str, sender_email: str = "") -> str:
         return body.rstrip()
 
     name_env = (os.getenv("SIGNATURE_NAME") or "").strip()
-    name = name_env or _signature_name_from_email(sender_email) or "Ashutosh Sharma"
-    company = (os.getenv("SIGNATURE_COMPANY") or "HireQuotient").strip()
-    email = (
-        os.getenv("SIGNATURE_EMAIL")
-        or os.getenv("UNSUBSCRIBE_MAILTO")
-        or os.getenv("UNSUBSCRIBE_EMAIL")
-        or "privacy@recruitagents.net"
-    ).strip()
+    name = name_env or _signature_name_from_email(sender_email)
+    company = (os.getenv("SIGNATURE_COMPANY") or "").strip()
+    email = (os.getenv("SIGNATURE_EMAIL") or "").strip()
     title = (os.getenv("SIGNATURE_TITLE") or "").strip()
     closing = (os.getenv("SIGNATURE_CLOSING") or "Best,").strip()
 

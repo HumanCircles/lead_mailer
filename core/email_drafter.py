@@ -35,6 +35,52 @@ def _parse_json(raw: str) -> dict:
         raise ValueError(f"Could not parse JSON:\n{raw[:300]}")
 
 
+def _format_body_for_plaintext(body: str) -> str:
+    """
+    Ensure readable plain-text email formatting with short paragraphs.
+    If model output comes as one dense block, split it into short sections.
+    """
+    text = strip_control_chars(body or "").replace("\r\n", "\n").strip()
+    if not text:
+        return ""
+
+    # Normalize whitespace inside lines while preserving existing paragraph breaks.
+    lines = [re.sub(r"\s+", " ", ln).strip() for ln in text.split("\n")]
+    text = "\n".join(lines)
+    text = re.sub(r"\n{3,}", "\n\n", text).strip()
+
+    # If already paragraphized, keep it mostly as-is.
+    if "\n\n" in text:
+        return text
+
+    # Greeting line stays on its own when present.
+    greeting = ""
+    remainder = text
+    first_line_split = re.split(r"\n", text, maxsplit=1)
+    first_line = first_line_split[0].strip()
+    if re.match(r"^(hi|hello)\b", first_line, flags=re.IGNORECASE):
+        greeting = first_line
+        remainder = first_line_split[1].strip() if len(first_line_split) > 1 else ""
+
+    source = remainder or text
+    sentences = [s.strip() for s in re.split(r"(?<=[.!?])\s+", source) if s.strip()]
+    if len(sentences) <= 2:
+        return f"{greeting}\n\n{source}".strip() if greeting else source
+
+    paras: list[str] = []
+    if greeting:
+        paras.append(greeting)
+
+    i = 0
+    while i < len(sentences):
+        # Keep paragraphs concise: 1-2 sentences each.
+        take = 2 if i < len(sentences) - 1 else 1
+        paras.append(" ".join(sentences[i:i + take]).strip())
+        i += take
+
+    return "\n\n".join(p for p in paras if p).strip()
+
+
 def draft_email(lead_data: dict) -> dict:
     name     = strip_control_chars(str(lead_data.get("name", "") or ""))
     company  = strip_control_chars(str(lead_data.get("company", "") or ""))
@@ -65,7 +111,9 @@ Write the email following the playbook exactly. Return JSON only — no markdown
         raw = (resp.choices[0].message.content or "").strip()
         if raw:
             try:
-                return _parse_json(raw)
+                parsed = _parse_json(raw)
+                parsed["body"] = _format_body_for_plaintext(str(parsed.get("body", "") or ""))
+                return parsed
             except ValueError:
                 if attempt == 0:
                     continue

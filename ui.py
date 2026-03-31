@@ -318,7 +318,7 @@ with col_gs:
 
             r = st.session_state.results[k]
             try:
-                send_email(p["email"], r["subject"], r["body"])
+                send_email(p["email"], r["subject"], r["body"], p.get("first_name", ""))
                 st.session_state.results[k]["status"] = "sent"
                 st.session_state.results[k]["error"] = ""
             except Exception as e:
@@ -380,7 +380,7 @@ with send_all_col:
             stat.caption(f"[{i+1}/{len(unsent)}] Sending to {p['first_name']} {p['last_name']}…")
             prog.progress(int((i + 1) / len(unsent) * 100))
             try:
-                send_email(p["email"], res["subject"], res["body"])
+                send_email(p["email"], res["subject"], res["body"], p.get("first_name", ""))
                 st.session_state.results[k]["status"] = "sent"
             except Exception as e:
                 st.session_state.results[k]["status"] = "failed"
@@ -452,7 +452,7 @@ with right:
             if st.button("Send", type="primary", width="stretch", key=f"send_{k}"):
                 with st.spinner("Sending…"):
                     try:
-                        from_addr = send_email(p["email"], subj, body)
+                        from_addr = send_email(p["email"], subj, body, p.get("first_name", ""))
                         st.session_state.results[k]["status"] = "sent"
                         st.success(f"Sent via {from_addr}")
                     except Exception as e:

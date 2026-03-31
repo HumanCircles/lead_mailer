@@ -2,6 +2,7 @@ import csv
 import itertools
 import os
 import random
+import re
 import smtplib
 import threading
 import time
@@ -107,12 +108,31 @@ def smtp_deliver(from_email: str, password: str, to_email: str, msg_as_string: s
             time.sleep(backoff)
 
 
-def send_email(to_email: str, subject: str, body: str) -> str:
+def _recipient_first_name(name: str) -> str:
+    cleaned = re.sub(r"[^A-Za-z\s'-]", " ", (name or "")).strip()
+    if not cleaned:
+        return ""
+    first = cleaned.split()[0]
+    return first[:1].upper() + first[1:].lower()
+
+
+def _ensure_recipient_greeting(body: str, recipient_first_name: str) -> str:
+    text = (body or "").strip()
+    if not text:
+        return text
+    if re.match(r"^(hi|hello)\b", text, flags=re.IGNORECASE):
+        return text
+    first = _recipient_first_name(recipient_first_name)
+    return f"Hi {first},\n\n{text}" if first else text
+
+
+def send_email(to_email: str, subject: str, body: str, recipient_first_name: str = "") -> str:
     if is_suppressed(to_email):
         raise ValueError(f"Not sending: address is on suppression list ({to_email.strip().lower()})")
 
     sender_email, app_password = _next_sender()
-    body_out = append_signature_block(body, sender_email=sender_email)
+    body_out = _ensure_recipient_greeting(body, recipient_first_name)
+    body_out = append_signature_block(body_out, sender_email=sender_email)
     body_out = append_unsubscribe_footer(body_out)
 
     msg = MIMEMultipart("alternative")
