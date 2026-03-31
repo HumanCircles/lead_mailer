@@ -17,3 +17,9 @@ __pycache__/
 *.egg-info/
 .venv/
 venv/
+
+# Logs
+logs/
+
+# Superpowers
+.superpowers/
