@@ -8,10 +8,12 @@ import time
 from datetime import datetime, timezone
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
+from email.utils import formatdate
 
 from dotenv import load_dotenv
 
 from core.deliverability import (
+    append_signature_block,
     append_unsubscribe_footer,
     apply_list_unsubscribe_headers,
     is_suppressed,
@@ -110,12 +112,14 @@ def send_email(to_email: str, subject: str, body: str) -> str:
         raise ValueError(f"Not sending: address is on suppression list ({to_email.strip().lower()})")
 
     sender_email, app_password = _next_sender()
-    body_out = append_unsubscribe_footer(body)
+    body_out = append_signature_block(body, sender_email=sender_email)
+    body_out = append_unsubscribe_footer(body_out)
 
     msg = MIMEMultipart("alternative")
     msg["Subject"] = subject
     msg["From"]    = smtp_from_header(FROM_DISPLAY, sender_email)
     msg["To"]      = to_email
+    msg["Date"]    = formatdate(localtime=True)
     msg.attach(MIMEText(body_out, "plain"))
     apply_list_unsubscribe_headers(msg)
 

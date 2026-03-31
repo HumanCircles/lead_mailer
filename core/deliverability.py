@@ -69,6 +69,17 @@ def smtp_from_header(display_name: str | None, sender_email: str) -> str:
     return formataddr((name, addr))
 
 
+def _signature_name_from_email(sender_email: str) -> str:
+    """Derive a readable signature name from sender local-part."""
+    local = sender_email.strip().split("@", 1)[0]
+    if not local:
+        return ""
+    parts = [p for p in re.split(r"[._\-]+", local) if p]
+    if not parts:
+        return ""
+    return " ".join(p[:1].upper() + p[1:].lower() for p in parts)
+
+
 def append_unsubscribe_footer(body: str) -> str:
     raw = os.getenv("UNSUBSCRIBE_FOOTER_ENABLED", "true").strip().lower()
     if raw in ("0", "false", "no", "off"):
@@ -79,6 +90,34 @@ def append_unsubscribe_footer(body: str) -> str:
         line = f"\n\nTo opt out of future messages: mailto:{addr}?subject={subj}"
         return body.rstrip() + line
     return body.rstrip() + "\n\nTo opt out, reply with the word unsubscribe."
+
+
+def append_signature_block(body: str, sender_email: str = "") -> str:
+    """Append a plain-text signature block for consistent professional formatting."""
+    enabled = os.getenv("SIGNATURE_ENABLED", "true").strip().lower()
+    if enabled in ("0", "false", "no", "off"):
+        return body.rstrip()
+
+    name_env = (os.getenv("SIGNATURE_NAME") or "").strip()
+    name = name_env or _signature_name_from_email(sender_email) or "Ashutosh Sharma"
+    company = (os.getenv("SIGNATURE_COMPANY") or "HireQuotient").strip()
+    email = (
+        os.getenv("SIGNATURE_EMAIL")
+        or os.getenv("UNSUBSCRIBE_MAILTO")
+        or os.getenv("UNSUBSCRIBE_EMAIL")
+        or "privacy@recruitagents.net"
+    ).strip()
+    title = (os.getenv("SIGNATURE_TITLE") or "").strip()
+    closing = (os.getenv("SIGNATURE_CLOSING") or "Best,").strip()
+
+    lines = [closing, name]
+    if title:
+        lines.append(title)
+    lines.append(company)
+    if email:
+        lines.append(email)
+    signature = "\n".join(lines)
+    return body.rstrip() + f"\n\n{signature}"
 
 
 def apply_list_unsubscribe_headers(msg: Message) -> None:
