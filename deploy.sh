@@ -26,7 +26,7 @@ rsync -avz --delete \
     --exclude '.git' \
     --exclude 'venv' \
     --exclude '.DS_Store' \
-    --exclude 'sent_log.csv' \
+    --exclude '*.csv' \
     --exclude '.claude' \
     -e "ssh $SSH_OPTS -i $KEY_FILE" \
     ./ $EC2_HOST:$APP_DIR/
