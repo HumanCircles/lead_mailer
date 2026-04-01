@@ -90,6 +90,9 @@ def _generate_one(
     if stop_event.is_set():
         return
     email = prospect.get("email", "").strip().lower()
+    if not email:
+        on_result(_make_log_row(prospect, "", "skipped_no_email"))
+        return
     if is_suppressed(email):
         on_result(_make_log_row(prospect, "", "skipped_suppressed"))
         return

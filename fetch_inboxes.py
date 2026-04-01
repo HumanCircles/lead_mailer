@@ -9,19 +9,52 @@ Writes: inbox_replies.csv
 """
 
 import csv
-import email
 import imaplib
 import os
 import socket
 import ssl
 import sys
+import time
+from datetime import datetime, timezone
+from email import message_from_bytes
 from email.header import decode_header
+from email.message import Message
+from email.utils import parsedate_to_datetime
 
 socket.setdefaulttimeout(TIMEOUT_SECS := 15)
 
 IMAP_PORT  = 993
 INPUT_CSV  = "sender_inboxes.csv"
 OUTPUT_CSV = "inbox_replies.csv"
+
+# IMAP SINCE (RFC 3501 dd-Mon-yyyy). Narrow this + post-filter so exports are not full-year noise.
+IMAP_SINCE = os.environ.get("INBOX_IMAP_SINCE", "30-Mar-2026")
+# Inclusive floor for the message Date: header, interpreted then compared in UTC (ISO YYYY-MM-DD).
+INBOX_MIN_DATE_UTC = os.environ.get("INBOX_SINCE_DATE", "2026-03-30")
+
+
+def _min_utc() -> datetime:
+    y, m, d = map(int, INBOX_MIN_DATE_UTC.strip().split("-"))
+    return datetime(y, m, d, tzinfo=timezone.utc)
+
+
+def _date_header_utc(date_header: str) -> datetime | None:
+    if not (date_header or "").strip():
+        return None
+    try:
+        dt = parsedate_to_datetime(date_header.strip())
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc)
+    except (TypeError, ValueError, OverflowError):
+        return None
+
+
+def _keep_row(date_header: str) -> bool:
+    dt = _date_header_utc(date_header)
+    if dt is None:
+        return False
+    return dt >= _min_utc()
 
 # Explicit host overrides for domains where mail.<domain> is wrong
 IMAP_HOST_MAP = {
@@ -45,7 +78,7 @@ def _decode_header_value(raw) -> str:
     return "".join(out).strip()
 
 
-def _get_body_snippet(msg: email.message.Message, max_chars: int = 300) -> str:
+def _get_body_snippet(msg: Message, max_chars: int = 300) -> str:
     """Extract plain-text body snippet from a MIME message."""
     if msg.is_multipart():
         for part in msg.walk():
@@ -74,7 +107,7 @@ def fetch_inbox(account_email: str, password: str) -> list[dict]:
             imap.login(account_email, password)
             imap.select("INBOX", readonly=True)
 
-            _, data = imap.search(None, "SINCE", "01-Jan-2026")
+            _, data = imap.search(None, "SINCE", IMAP_SINCE)
             msg_ids = data[0].split() if data[0] else []
 
             if msg_ids:
@@ -94,12 +127,15 @@ def fetch_inbox(account_email: str, password: str) -> list[dict]:
                         i += 2
                     else:
                         i += 1
-                    msg = email.message_from_bytes(raw_headers + b"\r\n" + raw_body)
+                    msg = message_from_bytes(raw_headers + b"\r\n" + raw_body)
+                    date_h = _decode_header_value(msg.get("Date", ""))
+                    if not _keep_row(date_h):
+                        continue
                     rows.append({
                         "inbox":   account_email,
                         "from":    _decode_header_value(msg.get("From", "")),
                         "subject": _decode_header_value(msg.get("Subject", "")),
-                        "date":    _decode_header_value(msg.get("Date", "")),
+                        "date":    date_h,
                         "body":    (raw_body.decode("utf-8", errors="replace").strip())[:300],
                     })
     except imaplib.IMAP4.error as e:
@@ -109,6 +145,11 @@ def fetch_inbox(account_email: str, password: str) -> list[dict]:
     except Exception as e:
         print(f"  [ERROR] {account_email}: {e}")
 
+    def _sort_key(r: dict) -> float:
+        dt = _date_header_utc(r.get("date", ""))
+        return -(dt.timestamp() if dt else 0.0)
+
+    rows.sort(key=_sort_key)
     return rows
 
 
@@ -116,6 +157,11 @@ def main():
     if not os.path.isfile(INPUT_CSV):
         print(f"ERROR: {INPUT_CSV} not found. Run from the lead_mailer directory.")
         sys.exit(1)
+
+    print(
+        f"IMAP SINCE {IMAP_SINCE!r}; keeping rows with Date >= {_min_utc().date().isoformat()} UTC "
+        f"(set INBOX_IMAP_SINCE / INBOX_SINCE_DATE to override).\n"
+    )
 
     with open(INPUT_CSV, newline="", encoding="utf-8") as f:
         accounts = list(csv.DictReader(f))
@@ -149,6 +195,7 @@ def main():
             writer.writerows(rows)
             out_file.flush()
             total += len(rows)
+            time.sleep(0.5)
     finally:
         out_file.close()
 

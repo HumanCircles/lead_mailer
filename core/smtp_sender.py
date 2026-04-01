@@ -155,8 +155,8 @@ def is_siteground_hourly_lockout(exc: BaseException) -> bool:
         {'email@x.com': (550, b'...already sent N messages for 1h...')}
     We match on all three substrings to avoid false positives.
     """
-    s = str(exc)
-    return "550" in s and "already sent" in s and "messages for 1h" in s
+    s = str(exc).replace("\n", " ")
+    return "550" in s and "already sent" in s and "messages" in s and "for 1h" in s
 
 
 def classify_smtp_error(exc: BaseException) -> str:
