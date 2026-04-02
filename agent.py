@@ -20,7 +20,7 @@ from dotenv import load_dotenv
 from core.logger import IST, get_logger
 from core.pipeline import run_pipeline
 from core.prospect_csv import canonicalize_prospect_row
-from core.smtp_sender import send_seed_email
+from core.sendgrid_sender import send_seed_email
 
 load_dotenv()
 
