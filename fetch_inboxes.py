@@ -1,205 +1,302 @@
 """
-Fetch inbox emails from all sender accounts via IMAP and write to inbox_replies.csv.
+Fetch replies from all sender inboxes via IMAP.
+
+Reads sender pool directly from SENDER_POOL in .env — no separate CSV needed.
+Writes results to inbox_replies.csv (or --output path).
 
 Usage:
-    python fetch_inboxes.py
-
-Reads:  sender_inboxes.csv  (columns: email, password, domain)
-Writes: inbox_replies.csv
+    python fetch_inboxes.py                          # last 7 days
+    python fetch_inboxes.py --since 2026-03-25
+    python fetch_inboxes.py --since 2026-03-25 --until 2026-04-01
+    python fetch_inboxes.py --since 2026-03-25 --output my_replies.csv
+    python fetch_inboxes.py --workers 40             # parallel IMAP connections
 """
 
+from __future__ import annotations
+
+import argparse
 import csv
 import imaplib
 import os
 import socket
 import ssl
 import sys
+import threading
 import time
-from datetime import datetime, timezone
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime, timedelta, timezone
 from email import message_from_bytes
 from email.header import decode_header
 from email.message import Message
 from email.utils import parsedate_to_datetime
 
-socket.setdefaulttimeout(TIMEOUT_SECS := 15)
+from dotenv import load_dotenv
 
-IMAP_PORT  = 993
-INPUT_CSV  = "sender_inboxes.csv"
-OUTPUT_CSV = "inbox_replies.csv"
+load_dotenv()
 
-# IMAP SINCE (RFC 3501 dd-Mon-yyyy). Narrow this + post-filter so exports are not full-year noise.
-IMAP_SINCE = os.environ.get("INBOX_IMAP_SINCE", "30-Mar-2026")
-# Inclusive floor for the message Date: header, interpreted then compared in UTC (ISO YYYY-MM-DD).
-INBOX_MIN_DATE_UTC = os.environ.get("INBOX_SINCE_DATE", "2026-03-30")
+IMAP_PORT    = 993
+TIMEOUT_SECS = 20
+OUTPUT_CSV   = "inbox_replies.csv"
+FIELDNAMES   = ["inbox", "from", "subject", "date", "body"]
 
-
-def _min_utc() -> datetime:
-    y, m, d = map(int, INBOX_MIN_DATE_UTC.strip().split("-"))
-    return datetime(y, m, d, tzinfo=timezone.utc)
-
-
-def _date_header_utc(date_header: str) -> datetime | None:
-    if not (date_header or "").strip():
-        return None
-    try:
-        dt = parsedate_to_datetime(date_header.strip())
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=timezone.utc)
-        return dt.astimezone(timezone.utc)
-    except (TypeError, ValueError, OverflowError):
-        return None
-
-
-def _keep_row(date_header: str) -> bool:
-    dt = _date_header_utc(date_header)
-    if dt is None:
-        return False
-    return dt >= _min_utc()
-
-# Explicit host overrides for domains where mail.<domain> is wrong
+# Explicit IMAP host overrides (when mail.<domain> is wrong)
 IMAP_HOST_MAP = {
     "superchargedai.org": "gvam1039.siteground.biz",
 }
 
+_print_lock = threading.Lock()
 
-def _decode_header_value(raw) -> str:
+
+# ── CLI ───────────────────────────────────────────────────────────────────────
+
+def _parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(description="Fetch inbox replies from all sender accounts")
+    p.add_argument(
+        "--since", default="",
+        metavar="YYYY-MM-DD",
+        help="Fetch emails on or after this date (default: 7 days ago)",
+    )
+    p.add_argument(
+        "--until", default="",
+        metavar="YYYY-MM-DD",
+        help="Fetch emails on or before this date (default: today)",
+    )
+    p.add_argument(
+        "--output", default=OUTPUT_CSV,
+        metavar="PATH",
+        help=f"Output CSV path (default: {OUTPUT_CSV})",
+    )
+    p.add_argument(
+        "--workers", type=int, default=30,
+        metavar="N",
+        help="Parallel IMAP connections (default: 30)",
+    )
+    p.add_argument(
+        "--fresh", action="store_true",
+        help="Overwrite output file instead of appending/resuming",
+    )
+    return p.parse_args()
+
+
+# ── Pool loading ──────────────────────────────────────────────────────────────
+
+def _load_sender_pool() -> list[tuple[str, str]]:
+    """Parse SENDER_POOL env var → list of (email, password)."""
+    raw = os.getenv("SENDER_POOL", "").strip()
+    if not raw:
+        print("ERROR: SENDER_POOL is not set in .env")
+        sys.exit(1)
+    pairs = []
+    for entry in raw.split(","):
+        entry = entry.strip()
+        if ":" in entry:
+            email, pwd = entry.split(":", 1)
+            if "@" in email:
+                pairs.append((email.strip(), pwd.strip()))
+        elif "@" in entry:
+            # email only — no password, IMAP won't work but keep for visibility
+            pairs.append((entry.strip(), ""))
+    return pairs
+
+
+# ── Date helpers ──────────────────────────────────────────────────────────────
+
+def _to_imap_date(dt: datetime) -> str:
+    """Format datetime as IMAP SINCE/BEFORE string: DD-Mon-YYYY."""
+    return dt.strftime("%-d-%b-%Y")   # e.g. 1-Apr-2026
+
+
+def _parse_date_header(raw: str) -> datetime | None:
+    if not (raw or "").strip():
+        return None
+    try:
+        dt = parsedate_to_datetime(raw.strip())
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc)
+    except Exception:
+        return None
+
+
+def _in_range(date_raw: str, since: datetime, until: datetime) -> bool:
+    dt = _parse_date_header(date_raw)
+    if dt is None:
+        return False
+    return since <= dt <= until
+
+
+# ── Header / body helpers ─────────────────────────────────────────────────────
+
+def _decode_hdr(raw) -> str:
     if not raw:
         return ""
     parts = decode_header(raw)
     out = []
     for chunk, charset in parts:
         if isinstance(chunk, bytes):
-            try:
-                out.append(chunk.decode(charset or "utf-8", errors="replace"))
-            except (LookupError, UnicodeDecodeError):
-                out.append(chunk.decode("utf-8", errors="replace"))
+            out.append(chunk.decode(charset or "utf-8", errors="replace"))
         else:
             out.append(chunk)
     return "".join(out).strip()
 
 
-def _get_body_snippet(msg: Message, max_chars: int = 300) -> str:
-    """Extract plain-text body snippet from a MIME message."""
+def _body_snippet(msg: Message, max_chars: int = 400) -> str:
     if msg.is_multipart():
         for part in msg.walk():
             if part.get_content_type() == "text/plain" and not part.get("Content-Disposition"):
                 payload = part.get_payload(decode=True)
                 if payload:
-                    text = payload.decode(part.get_content_charset() or "utf-8", errors="replace")
-                    return text.strip()[:max_chars]
+                    return payload.decode(part.get_content_charset() or "utf-8", errors="replace").strip()[:max_chars]
     else:
         payload = msg.get_payload(decode=True)
         if payload:
-            text = payload.decode(msg.get_content_charset() or "utf-8", errors="replace")
-            return text.strip()[:max_chars]
+            return payload.decode(msg.get_content_charset() or "utf-8", errors="replace").strip()[:max_chars]
     return ""
 
 
-def fetch_inbox(account_email: str, password: str) -> list[dict]:
-    """Connect via IMAP and return list of message dicts from INBOX."""
+# ── IMAP fetch ────────────────────────────────────────────────────────────────
+
+def fetch_inbox(
+    account_email: str,
+    password: str,
+    since: datetime,
+    until: datetime,
+) -> list[dict]:
+    """Connect to IMAP and return messages in the [since, until] range."""
     domain = account_email.split("@", 1)[1]
     host   = IMAP_HOST_MAP.get(domain, f"mail.{domain}")
-    rows   = []
+    rows: list[dict] = []
 
+    socket.setdefaulttimeout(TIMEOUT_SECS)
     try:
         ctx = ssl.create_default_context()
         with imaplib.IMAP4_SSL(host, IMAP_PORT, ssl_context=ctx) as imap:
             imap.login(account_email, password)
             imap.select("INBOX", readonly=True)
 
-            _, data = imap.search(None, "SINCE", IMAP_SINCE)
+            imap_since = _to_imap_date(since)
+            _, data = imap.search(None, "SINCE", imap_since)
             msg_ids = data[0].split() if data[0] else []
 
-            if msg_ids:
-                id_range = f"{msg_ids[0].decode()}:{msg_ids[-1].decode()}"
-                _, msg_data = imap.fetch(id_range, "(BODY[HEADER.FIELDS (FROM SUBJECT DATE)] BODY.PEEK[TEXT]<0.400>)")
-                i = 0
-                while i < len(msg_data):
-                    item = msg_data[i]
-                    if not isinstance(item, tuple):
-                        i += 1
-                        continue
-                    raw_headers = item[1] if item[1] else b""
-                    # body peek is the next tuple element or next item
-                    raw_body = b""
-                    if i + 1 < len(msg_data) and isinstance(msg_data[i + 1], tuple):
-                        raw_body = msg_data[i + 1][1] or b""
-                        i += 2
-                    else:
-                        i += 1
-                    msg = message_from_bytes(raw_headers + b"\r\n" + raw_body)
-                    date_h = _decode_header_value(msg.get("Date", ""))
-                    if not _keep_row(date_h):
-                        continue
-                    rows.append({
-                        "inbox":   account_email,
-                        "from":    _decode_header_value(msg.get("From", "")),
-                        "subject": _decode_header_value(msg.get("Subject", "")),
-                        "date":    date_h,
-                        "body":    (raw_body.decode("utf-8", errors="replace").strip())[:300],
-                    })
+            if not msg_ids:
+                return rows
+
+            id_range = f"{msg_ids[0].decode()}:{msg_ids[-1].decode()}"
+            _, msg_data = imap.fetch(
+                id_range,
+                "(BODY[HEADER.FIELDS (FROM SUBJECT DATE)] BODY.PEEK[TEXT]<0.500>)"
+            )
+
+            i = 0
+            while i < len(msg_data):
+                item = msg_data[i]
+                if not isinstance(item, tuple):
+                    i += 1
+                    continue
+                raw_headers = item[1] or b""
+                raw_body    = b""
+                if i + 1 < len(msg_data) and isinstance(msg_data[i + 1], tuple):
+                    raw_body = msg_data[i + 1][1] or b""
+                    i += 2
+                else:
+                    i += 1
+
+                msg    = message_from_bytes(raw_headers + b"\r\n" + raw_body)
+                date_h = _decode_hdr(msg.get("Date", ""))
+
+                if not _in_range(date_h, since, until):
+                    continue
+
+                rows.append({
+                    "inbox":   account_email,
+                    "from":    _decode_hdr(msg.get("From",    "")),
+                    "subject": _decode_hdr(msg.get("Subject", "")),
+                    "date":    date_h,
+                    "body":    raw_body.decode("utf-8", errors="replace").strip()[:400],
+                })
+
     except imaplib.IMAP4.error as e:
-        print(f"  [AUTH ERROR] {account_email}: {e}")
+        with _print_lock:
+            print(f"  [AUTH] {account_email}: {e}")
     except (OSError, TimeoutError) as e:
-        print(f"  [TIMEOUT/NET] {account_email}: {e}")
+        with _print_lock:
+            print(f"  [NET]  {account_email}: {e}")
     except Exception as e:
-        print(f"  [ERROR] {account_email}: {e}")
+        with _print_lock:
+            print(f"  [ERR]  {account_email}: {e}")
 
-    def _sort_key(r: dict) -> float:
-        dt = _date_header_utc(r.get("date", ""))
-        return -(dt.timestamp() if dt else 0.0)
-
-    rows.sort(key=_sort_key)
+    # newest first
+    rows.sort(key=lambda r: -(_parse_date_header(r["date"]) or datetime.min.replace(tzinfo=timezone.utc)).timestamp())
     return rows
 
 
-def main():
-    if not os.path.isfile(INPUT_CSV):
-        print(f"ERROR: {INPUT_CSV} not found. Run from the lead_mailer directory.")
-        sys.exit(1)
+# ── Main ──────────────────────────────────────────────────────────────────────
 
-    print(
-        f"IMAP SINCE {IMAP_SINCE!r}; keeping rows with Date >= {_min_utc().date().isoformat()} UTC "
-        f"(set INBOX_IMAP_SINCE / INBOX_SINCE_DATE to override).\n"
+def main() -> None:
+    args = _parse_args()
+
+    now_utc = datetime.now(timezone.utc)
+    since = (
+        datetime.fromisoformat(args.since).replace(tzinfo=timezone.utc)
+        if args.since else
+        (now_utc - timedelta(days=7)).replace(hour=0, minute=0, second=0, microsecond=0)
+    )
+    until = (
+        datetime.fromisoformat(args.until).replace(hour=23, minute=59, second=59, tzinfo=timezone.utc)
+        if args.until else
+        now_utc
     )
 
-    with open(INPUT_CSV, newline="", encoding="utf-8") as f:
-        accounts = list(csv.DictReader(f))
+    accounts = _load_sender_pool()
 
-    # Load already-done inboxes so restarts skip them
+    # Resume: skip accounts already in output unless --fresh
     done: set[str] = set()
-    fieldnames = ["inbox", "from", "subject", "date", "body"]
-    if os.path.isfile(OUTPUT_CSV):
-        with open(OUTPUT_CSV, newline="", encoding="utf-8") as f:
+    if not args.fresh and os.path.isfile(args.output):
+        with open(args.output, newline="", encoding="utf-8") as f:
             for row in csv.DictReader(f):
-                done.add(row["inbox"])
-        print(f"Resuming — {len(done)} accounts already saved, skipping.\n")
+                done.add(row.get("inbox", ""))
+        print(f"Resuming — {len(done)} accounts already fetched, skipping.")
 
-    write_header = not os.path.isfile(OUTPUT_CSV)
-    out_file = open(OUTPUT_CSV, "a", newline="", encoding="utf-8")
-    writer = csv.DictWriter(out_file, fieldnames=fieldnames)
+    pending = [(e, p) for e, p in accounts if e not in done]
+    if not pending:
+        print("Nothing to fetch.")
+        return
+
+    print(
+        f"\nFetching {len(pending)} inboxes  [{since.date()} → {until.date()}]"
+        f"  ({args.workers} parallel connections)\n"
+    )
+
+    write_header = args.fresh or not os.path.isfile(args.output)
+    out_file = open(args.output, "w" if args.fresh else "a", newline="", encoding="utf-8")
+    writer   = csv.DictWriter(out_file, fieldnames=FIELDNAMES)
     if write_header:
         writer.writeheader()
 
-    total = 0
-    try:
-        for i, acct in enumerate(accounts, 1):
-            acct_email = acct["email"].strip()
-            password   = acct["password"].strip()
-            if acct_email in done:
-                print(f"[{i:>3}/{len(accounts)}] {acct_email} ... skipped")
-                continue
-            print(f"[{i:>3}/{len(accounts)}] {acct_email}", end=" ... ", flush=True)
-            rows = fetch_inbox(acct_email, password)
-            print(f"{len(rows)} messages")
-            writer.writerows(rows)
-            out_file.flush()
-            total += len(rows)
-            time.sleep(0.5)
-    finally:
-        out_file.close()
+    total    = 0
+    done_n   = [0]
+    lock     = threading.Lock()
 
-    print(f"\nDone. {total} new messages written → {OUTPUT_CSV}")
+    def _fetch_one(email: str, pwd: str) -> tuple[str, list[dict]]:
+        rows = fetch_inbox(email, pwd, since, until)
+        return email, rows
+
+    with ThreadPoolExecutor(max_workers=args.workers) as pool:
+        futures = {pool.submit(_fetch_one, e, p): e for e, p in pending}
+        for fut in as_completed(futures):
+            email, rows = fut.result()
+            with lock:
+                done_n[0] += 1
+                writer.writerows(rows)
+                out_file.flush()
+                total += len(rows)
+                print(
+                    f"[{done_n[0]:>3}/{len(pending)}]  {email:<45}  {len(rows)} messages",
+                    flush=True,
+                )
+
+    out_file.close()
+    print(f"\nDone — {total} messages written → {args.output}")
 
 
 if __name__ == "__main__":
