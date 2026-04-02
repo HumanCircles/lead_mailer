@@ -17,6 +17,52 @@ import re
 DEFAULT_INPUT  = "inbox_replies.csv"
 DEFAULT_OUTPUT = "real_replies.csv"
 
+FIELDNAMES = ["inbox", "from", "subject", "date", "body"]
+
+
+def _norm_header_cell(s: str) -> str:
+    return (s or "").strip().lower().replace("\ufeff", "")
+
+
+def _is_header_row(cells: list[str]) -> bool:
+    if len(cells) < len(FIELDNAMES):
+        return False
+    return [_norm_header_cell(c) for c in cells[: len(FIELDNAMES)]] == [
+        h.lower() for h in FIELDNAMES
+    ]
+
+
+def _row_to_record(cells: list[str]) -> dict[str, str] | None:
+    """Map a csv.reader row to FIELDNAMES; handles ragged rows."""
+    if not cells or not any((c or "").strip() for c in cells):
+        return None
+    row = list(cells)
+    if len(row) < len(FIELDNAMES):
+        row.extend([""] * (len(FIELDNAMES) - len(row)))
+    elif len(row) > len(FIELDNAMES):
+        row = row[:4] + [",".join(row[4:])]
+    return dict(zip(FIELDNAMES, row, strict=True))
+
+
+def read_inbox_csv(path: str) -> list[dict[str, str]]:
+    """
+    Load fetch_inboxes.py output. Uses csv.reader so multiline quoted bodies parse
+    correctly. If the first row is the canonical header, it is skipped; if the file
+    has no header (first row is data), all rows are loaded as data.
+    """
+    with open(path, newline="", encoding="utf-8-sig") as f:
+        raw = list(csv.reader(f))
+    if not raw:
+        return []
+    start = 1 if _is_header_row(raw[0]) else 0
+    out: list[dict[str, str]] = []
+    for cells in raw[start:]:
+        rec = _row_to_record(cells)
+        if rec is not None:
+            out.append(rec)
+    return out
+
+
 # Sender addresses that are never real humans
 JUNK_SENDERS = re.compile(r"""
     mailer-daemon | postmaster | no-reply | noreply |
@@ -70,8 +116,7 @@ def main() -> None:
     input_csv = args.input
     output_csv = args.output
 
-    with open(input_csv, newline="", encoding="utf-8") as f:
-        rows = list(csv.DictReader(f))
+    rows = read_inbox_csv(input_csv)
 
     total  = len(rows)
     kept   = [r for r in rows if not is_junk(r)]
@@ -82,9 +127,8 @@ def main() -> None:
     print(f"Removed     : {removed:,}  (bounces / auto-replies / OOO / system)")
     print(f"Real replies: {len(kept):,}")
 
-    fieldnames = ["inbox", "from", "subject", "date", "body"]
     with open(output_csv, "w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer = csv.DictWriter(f, fieldnames=FIELDNAMES)
         writer.writeheader()
         writer.writerows(kept)
 

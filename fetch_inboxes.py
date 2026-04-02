@@ -1,11 +1,20 @@
 """
 Fetch replies from all sender inboxes via IMAP.
 
-Reads sender pool directly from SENDER_POOL in .env — no separate CSV needed.
-Writes results to inbox_replies.csv (or --output path).
+Account sources (pick one):
+  • SENDER_POOL in .env — comma-separated email:password (default)
+  • --csv PATH [...] — SuperchargedAI roster exports; columns Email + Password
+    (header names may differ between files; first matching columns are used)
+
+IMAP defaults to mail.<email-domain>:993 (SSL), which matches:
+  smartrecruitai.us, hirewithinsight.us, aihiringagents.us, smart-sight-hr.com
+  (all use Incoming mail.<domain> IMAP 993 / Outgoing SMTP 465.)
+
+Writes results to inbox_replies.csv (or --output path). Post-process with clean_inboxes.py.
 
 Usage:
-    python fetch_inboxes.py                          # last 7 days
+    python fetch_inboxes.py                          # last 7 days, from SENDER_POOL
+    python fetch_inboxes.py --csv a.csv b.csv      # from roster CSVs only
     python fetch_inboxes.py --since 2026-03-25
     python fetch_inboxes.py --since 2026-03-25 --until 2026-04-01
     python fetch_inboxes.py --since 2026-03-25 --output my_replies.csv
@@ -39,7 +48,8 @@ TIMEOUT_SECS = 40
 OUTPUT_CSV   = "inbox_replies.csv"
 FIELDNAMES   = ["inbox", "from", "subject", "date", "body"]
 
-# Explicit IMAP host overrides (when mail.<domain> is wrong)
+# Explicit IMAP host overrides (when mail.<domain> is wrong).
+# New HireQuotient domains use mail.<domain> :993 by default (no entry needed).
 IMAP_HOST_MAP = {
     "superchargedai.org": "gvam1039.siteground.biz",
 }
@@ -80,6 +90,10 @@ def _parse_args() -> argparse.Namespace:
         metavar="DOMAIN",
         help="Only fetch inboxes for this domain (e.g. easygrowth.us)",
     )
+    p.add_argument(
+        "--csv", action="append", default=[], metavar="PATH",
+        help="Roster CSV with Email + Password columns; repeat for multiple files (uses CSV only, not SENDER_POOL)",
+    )
     return p.parse_args()
 
 
@@ -102,6 +116,54 @@ def _load_sender_pool() -> list[tuple[str, str]]:
             # email only — no password, IMAP won't work but keep for visibility
             pairs.append((entry.strip(), ""))
     return pairs
+
+
+def _normalise_header_key(h: str) -> str:
+    return (h or "").strip().lower().replace("\ufeff", "")
+
+
+def _find_col(fieldnames: list[str], *candidates: str) -> str | None:
+    """Return original header name for first column whose normalised name is in candidates."""
+    want = {c.lower() for c in candidates}
+    for name in fieldnames:
+        if _normalise_header_key(name) in want:
+            return name
+    return None
+
+
+def _load_accounts_from_csvs(paths: list[str]) -> list[tuple[str, str]]:
+    """Load (email, password) from SuperchargedAI-style roster CSVs; later rows/files override same email."""
+    order: list[str] = []
+    by_email: dict[str, tuple[str, str]] = {}
+    for path in paths:
+        if not path.strip():
+            continue
+        if not os.path.isfile(path):
+            print(f"ERROR: CSV not found: {path}")
+            sys.exit(1)
+        with open(path, newline="", encoding="utf-8-sig") as f:
+            reader = csv.DictReader(f)
+            if not reader.fieldnames:
+                print(f"ERROR: no header row in {path}")
+                sys.exit(1)
+            email_col = _find_col(reader.fieldnames, "email")
+            pwd_col = _find_col(reader.fieldnames, "password")
+            if not email_col or not pwd_col:
+                print(
+                    f"ERROR: {path} needs Email and Password columns "
+                    f"(got {reader.fieldnames!r})"
+                )
+                sys.exit(1)
+            for row in reader:
+                email = (row.get(email_col) or "").strip()
+                pwd = (row.get(pwd_col) or "").strip()
+                if "@" not in email or not pwd:
+                    continue
+                key = email.lower()
+                if key not in by_email:
+                    order.append(key)
+                by_email[key] = (email, pwd)
+    return [by_email[k] for k in order]
 
 
 # ── Date helpers ──────────────────────────────────────────────────────────────
@@ -252,7 +314,14 @@ def main() -> None:
         now_utc
     )
 
-    accounts = _load_sender_pool()
+    if args.csv:
+        accounts = _load_accounts_from_csvs(args.csv)
+        if not accounts:
+            print("ERROR: no email:password rows found in given CSV file(s)")
+            sys.exit(1)
+        print(f"Loaded {len(accounts)} account(s) from {len(args.csv)} CSV file(s)")
+    else:
+        accounts = _load_sender_pool()
 
     if args.domain:
         accounts = [(e, p) for e, p in accounts if e.split("@", 1)[-1].lower() == args.domain.lower()]
