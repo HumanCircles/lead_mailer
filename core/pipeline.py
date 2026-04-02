@@ -81,6 +81,15 @@ def _all_senders_at_cap() -> bool:
     return True
 
 
+def _all_senders_at_daily_cap() -> bool:
+    """True when every sender has hit DAILY_LIMIT — no recovery possible until tomorrow."""
+    with _pool_lock:
+        return all(
+            state["daily"] >= DAILY_LIMIT
+            for state in _sender_state.values()
+        )
+
+
 def _generate_one(
     prospect: dict,
     draft_queue: "queue.Queue",
@@ -111,7 +120,13 @@ def _generate_one(
         if dry_run:
             on_result(_make_log_row(prospect, ec.get("subject", ""), "dry_run"))
         else:
-            draft_queue.put((prospect, ec))
+            # Use a timeout loop so stop_event can interrupt a full queue
+            while not stop_event.is_set():
+                try:
+                    draft_queue.put((prospect, ec), timeout=1)
+                    break
+                except queue.Full:
+                    continue
     except Exception as e:
         log.warning("LLM generation failed for %s: %s", email, e)
         on_result(_make_log_row(prospect, "", "failed_generation", str(e)))
@@ -144,6 +159,12 @@ def _send_phase(
         # Block until account has capacity (avoid 550 lockout)
         while _all_senders_at_cap() and not stop_event.is_set():
             wait = seconds_until_capacity_frees()
+            if _all_senders_at_daily_cap():
+                log.error("All senders have exhausted their daily limit — stopping pipeline")
+                print("\n[DAILY LIMIT] All sender accounts have hit the daily send cap. "
+                      "Restart tomorrow or increase DAILY_LIMIT.", flush=True)
+                stop_event.set()
+                break
             log.info("All senders at hourly cap — waiting %.0fs", wait)
             time.sleep(min(wait, 60))
 

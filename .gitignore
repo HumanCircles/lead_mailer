@@ -11,6 +11,9 @@ prospects.csv
 sent_log.csv
 suppression.txt
 
+# JavaScript (local Claude Code CLI only)
+node_modules/
+
 # Python
 __pycache__/
 *.py[cod]
@@ -25,3 +28,4 @@ logs/
 .superpowers/
 
 *.csv
+!/main.csv

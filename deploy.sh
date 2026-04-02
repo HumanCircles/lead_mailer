@@ -23,6 +23,7 @@ echo "⚠️  WARNING: This will overwrite the server's .env file with your loca
 
 rsync -avz --delete \
     --exclude '__pycache__' \
+    --exclude 'node_modules' \
     --exclude '.git' \
     --exclude 'venv' \
     --exclude '.DS_Store' \

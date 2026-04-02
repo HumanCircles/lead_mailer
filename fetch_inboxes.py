@@ -35,7 +35,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 IMAP_PORT    = 993
-TIMEOUT_SECS = 20
+TIMEOUT_SECS = 40
 OUTPUT_CSV   = "inbox_replies.csv"
 FIELDNAMES   = ["inbox", "from", "subject", "date", "body"]
 
@@ -67,13 +67,18 @@ def _parse_args() -> argparse.Namespace:
         help=f"Output CSV path (default: {OUTPUT_CSV})",
     )
     p.add_argument(
-        "--workers", type=int, default=30,
+        "--workers", type=int, default=10,
         metavar="N",
-        help="Parallel IMAP connections (default: 30)",
+        help="Parallel IMAP connections (default: 10)",
     )
     p.add_argument(
         "--fresh", action="store_true",
         help="Overwrite output file instead of appending/resuming",
+    )
+    p.add_argument(
+        "--domain", default="",
+        metavar="DOMAIN",
+        help="Only fetch inboxes for this domain (e.g. easygrowth.us)",
     )
     return p.parse_args()
 
@@ -248,6 +253,13 @@ def main() -> None:
     )
 
     accounts = _load_sender_pool()
+
+    if args.domain:
+        accounts = [(e, p) for e, p in accounts if e.split("@", 1)[-1].lower() == args.domain.lower()]
+        if not accounts:
+            print(f"No accounts found for domain: {args.domain}")
+            return
+        print(f"Filtering to {len(accounts)} account(s) matching @{args.domain}")
 
     # Resume: skip accounts already in output unless --fresh
     done: set[str] = set()

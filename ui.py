@@ -15,7 +15,7 @@ load_dotenv()
 from core.deliverability import is_suppressed, reload_suppression
 from core.email_drafter import draft_email
 from core.logger import IST
-from core.pipeline import SENT_LOG_FILE, run_pipeline
+from core.pipeline import CONCURRENT_SENDS, SENT_LOG_FILE, run_pipeline
 from core.prospect_csv import detect_column_mapping, normalise_prospects_dataframe
 from core.sendgrid_sender import (
     DAILY_LIMIT,
@@ -499,17 +499,15 @@ with tab_outreach:
                 prog = st.progress(0)
                 stat = st.empty()
                 n = len(pending_gs)
-                for i, p in enumerate(pending_gs):
-                    k    = _key(p)
-                    r0   = st.session_state.results.get(k, {})
+                _gs_lock = threading.Lock()
+                _gs_done = [0]
+
+                def _draft_and_send(p):
+                    k  = _key(p)
+                    r0 = st.session_state.results.get(k, {})
                     has_draft = bool(
                         str(r0.get("subject", "")).strip() and str(r0.get("body", "")).strip()
                     )
-                    stat.caption(
-                        f"[{i+1}/{n}] {p['first_name']} {p['last_name']}: "
-                        + ("send…" if has_draft else "draft + send…")
-                    )
-                    prog.progress(int((i + 1) / n * 100))
                     if not has_draft:
                         try:
                             ec = draft_email({
@@ -518,23 +516,39 @@ with tab_outreach:
                                 "title":        p.get("title", ""),
                                 "hcm_platform": p.get("hcm_platform", ""),
                             })
-                            st.session_state.results[k] = {
-                                "subject": ec["subject"], "body": ec["body"],
-                                "status": "done", "error": "",
-                            }
+                            with _gs_lock:
+                                st.session_state.results[k] = {
+                                    "subject": ec["subject"], "body": ec["body"],
+                                    "status": "done", "error": "",
+                                }
                         except Exception as e:
-                            st.session_state.results[k] = {
-                                "subject": "", "body": "", "status": "failed", "error": str(e),
-                            }
-                            continue
+                            with _gs_lock:
+                                st.session_state.results[k] = {
+                                    "subject": "", "body": "", "status": "failed", "error": str(e),
+                                }
+                            return k, str(e)
                     r = st.session_state.results[k]
                     try:
                         send_email(p["email"], r["subject"], r["body"], p.get("first_name", ""))
-                        st.session_state.results[k]["status"] = "sent"
-                        st.session_state.results[k]["error"]  = ""
+                        with _gs_lock:
+                            st.session_state.results[k]["status"] = "sent"
+                            st.session_state.results[k]["error"]  = ""
+                        return k, None
                     except Exception as e:
-                        st.session_state.results[k]["status"] = "failed"
-                        st.session_state.results[k]["error"]  = str(e)
+                        with _gs_lock:
+                            st.session_state.results[k]["status"] = "failed"
+                            st.session_state.results[k]["error"]  = str(e)
+                        return k, str(e)
+
+                with ThreadPoolExecutor(max_workers=CONCURRENT_SENDS) as _ex:
+                    _futs = {_ex.submit(_draft_and_send, p): p for p in pending_gs}
+                    for _fut in as_completed(_futs):
+                        with _gs_lock:
+                            _gs_done[0] += 1
+                            _i = _gs_done[0]
+                        _p  = _futs[_fut]
+                        stat.caption(f"[{_i}/{n}] {_p['first_name']} {_p['last_name']} done")
+                        prog.progress(int(_i / n * 100))
                 prog.empty(); stat.empty()
                 st.rerun()
 
@@ -572,21 +586,38 @@ with tab_outreach:
                              disabled=not unsent, use_container_width=True):
                     prog = st.progress(0)
                     stat = st.empty()
-                    failed = 0
-                    for i, p in enumerate(unsent):
+                    _sa_lock  = threading.Lock()
+                    _sa_done  = [0]
+                    _sa_failed = [0]
+
+                    def _send_one(p):
                         k   = _key(p)
                         res = results[k]
-                        stat.caption(f"[{i+1}/{len(unsent)}] Sending to {p['first_name']} {p['last_name']}…")
-                        prog.progress(int((i + 1) / len(unsent) * 100))
                         try:
                             send_email(p["email"], res["subject"], res["body"], p.get("first_name", ""))
-                            st.session_state.results[k]["status"] = "sent"
+                            with _sa_lock:
+                                st.session_state.results[k]["status"] = "sent"
+                            return None
                         except Exception as e:
-                            st.session_state.results[k]["status"] = "failed"
-                            st.session_state.results[k]["error"]  = str(e)
-                            failed += 1
+                            with _sa_lock:
+                                st.session_state.results[k]["status"] = "failed"
+                                st.session_state.results[k]["error"]  = str(e)
+                            return str(e)
+
+                    with ThreadPoolExecutor(max_workers=CONCURRENT_SENDS) as _ex:
+                        _futs = {_ex.submit(_send_one, p): p for p in unsent}
+                        for _fut in as_completed(_futs):
+                            err = _fut.result()
+                            with _sa_lock:
+                                _sa_done[0] += 1
+                                if err:
+                                    _sa_failed[0] += 1
+                                _i = _sa_done[0]
+                            _p = _futs[_fut]
+                            stat.caption(f"[{_i}/{len(unsent)}] {_p['first_name']} {_p['last_name']}…")
+                            prog.progress(int(_i / len(unsent) * 100))
                     prog.empty(); stat.empty()
-                    st.success(f"Sent {len(unsent)-failed}" + (f", {failed} failed" if failed else ""))
+                    st.success(f"Sent {len(unsent)-_sa_failed[0]}" + (f", {_sa_failed[0]} failed" if _sa_failed[0] else ""))
                     st.rerun()
 
             left, right = st.columns([1, 2], gap="large")

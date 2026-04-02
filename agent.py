@@ -45,20 +45,27 @@ def _init_log() -> None:
 
 
 def _migrate_log() -> None:
-    """Add from_email column to old sent_log.csv files that lack it."""
+    """Ensure sent_log.csv has a proper header row with all expected columns."""
     if not os.path.isfile(SENT_LOG_FILE):
         return
     with open(SENT_LOG_FILE, encoding="utf-8") as f:
         first = f.readline()
-    if "from_email" in first:
-        return
+    has_header = "prospect_email" in first or "timestamp" in first
+    if has_header and "from_email" in first:
+        return  # already up to date
     with open(SENT_LOG_FILE, newline="", encoding="utf-8") as f:
         rows = list(csv.reader(f))
     if not rows:
         return
-    header, *body = rows
-    new_header = header + ["from_email"]
-    padded = [list(r) + [""] * (len(new_header) - len(r)) for r in body]
+    if has_header:
+        # Has a header but missing from_email — append the column
+        header, *body = rows
+        new_header = header + ["from_email"]
+        padded = [list(r) + [""] * (len(new_header) - len(r)) for r in body]
+    else:
+        # No header at all — prepend one, data rows already have the right columns
+        new_header = _LOG_HEADERS
+        padded = rows
     with open(SENT_LOG_FILE, "w", newline="", encoding="utf-8") as f:
         w = csv.writer(f)
         w.writerow(new_header)
@@ -69,9 +76,18 @@ def _load_sent() -> set[str]:
     if not os.path.exists(SENT_LOG_FILE):
         return set()
     with open(SENT_LOG_FILE, encoding="utf-8") as f:
+        first = f.readline()
+    # If the file has no header row (written without headers), read with explicit names
+    has_header = "prospect_email" in first or "timestamp" in first
+    with open(SENT_LOG_FILE, encoding="utf-8") as f:
+        reader = (
+            csv.DictReader(f)
+            if has_header
+            else csv.DictReader(f, fieldnames=_LOG_HEADERS)
+        )
         return {
             row["prospect_email"].strip().lower()
-            for row in csv.DictReader(f)
+            for row in reader
             if row.get("status") == "pushed"
         }
 

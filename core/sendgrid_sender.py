@@ -259,7 +259,7 @@ def _sendgrid_deliver(
     unsubscribe_parts: list[str] = []
     mailto = (os.getenv("UNSUBSCRIBE_MAILTO") or os.getenv("UNSUBSCRIBE_EMAIL") or "").strip()
     if mailto:
-        unsubscribe_parts.append(f"<mailto:{mailto}?subject=Unsubscribe>")
+        unsubscribe_parts.append(f"<mailto:{mailto}>")
     url = os.getenv("UNSUBSCRIBE_URL", "").strip()
     if url:
         unsubscribe_parts.append(f"<{url}>")
