@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-AI-assisted BD outreach tool: load prospects from CSV → generate personalized emails via OpenAI (guided by `MESSAGING_README.md`) → send via SMTP (rotating sender pool, no Gmail/OAuth). Two entry points: an interactive Streamlit UI and a batch CLI.
+AI-assisted BD outreach tool: load prospects from CSV → generate personalized emails via OpenAI (guided by `MESSAGING_README.md`) → send via **SendGrid API** (rotating sender pool, domain-to-account routing). Two entry points: an interactive Streamlit UI and a batch CLI. A seed summary email is sent to the admin after every run.
 
 ## Commands
 
@@ -28,10 +28,10 @@ No test suite exists in this repo.
 
 All config is via `.env` (gitignored). Copy `.env.example` to `.env` and set at minimum:
 - `OPENAI_API_KEY`
-- `SENDER_POOL` — `email:password,email2:password2` comma-separated (mailboxes on `SMTP_HOST`)
-- `SMTP_HOST` / `SMTP_PORT` — your mail host (default `mail.recruitagents.net:465`)
+- `SENDGRID_ACCOUNTS` — `domain:api_key:pool_name` triples, comma-separated (see `.env.example` for the three production accounts)
+- `SENDER_POOL` — comma-separated sender email addresses (no passwords needed; SendGrid authenticates via API key)
 
-Key optional config: `DAILY_LIMIT`, `HOURLY_LIMIT`, `ACCOUNT_HOURLY_CAP`, `PROSPECTS_MAX` (0 = all), `SUPPRESSION_FILE`, `SIGNATURE_*`, `UNSUBSCRIBE_*`.
+Key optional config: `DAILY_LIMIT`, `HOURLY_LIMIT`, `PROSPECTS_MAX` (0 = all), `SUPPRESSION_FILE`, `SIGNATURE_*`, `UNSUBSCRIBE_*`, `SEED_EMAIL` (default `ashutosh@HireQuotient.com`).
 
 ## Architecture
 
@@ -44,9 +44,11 @@ OpenAI → JSON {subject, body}
     ↓
 deliverability.py: greeting check → append_signature_block → append_unsubscribe_footer
     ↓
-SMTP (rotating sender pool, daily/hourly throttle)
+SendGrid API (rotating sender pool, domain → API key + IP pool routing, daily/hourly throttle)
     ↓
 sent_log.csv (append-only audit log)
+    ↓
+send_seed_email() → ashutosh@HireQuotient.com (run summary)
 ```
 
 `MESSAGING_README.md` is the single source of truth for email voice and structure. It is read at startup by both `agent.py` and `core/email_drafter.py`.
@@ -67,7 +69,7 @@ sent_log.csv (append-only audit log)
 
 - **`email_drafter.py`** — used by the UI only. Creates a single module-level OpenAI client at import time. `draft_email()` returns `{subject, body}` and post-processes body for plain-text paragraph formatting.
 
-- **`smtp_sender.py`** — used by the UI only. Sender pool loaded at module import; daily counters hydrated from `sent_log.csv` immediately. `send_email()` checks suppression, rotates sender, appends signature + footer, delivers via `smtp_deliver()`.
+- **`smtp_sender.py`** — shared by both paths (despite the legacy name). Sender pool loaded at module import; daily/hourly counters hydrated from `sent_log.csv` immediately. Routes each sender by email domain to the correct SendGrid subaccount + IP pool (via `SENDGRID_ACCOUNTS`). `send_email()` checks suppression, rotates sender, appends signature + footer, delivers via SendGrid API. `send_seed_email()` sends admin notifications bypassing pool rotation.
 
 - **`deliverability.py`** — shared by both paths. Suppression list is loaded lazily and cached as a module-level `frozenset` (not reloaded during a session). `strip_control_chars()` sanitizes prospect data before it reaches the LLM.
 

@@ -20,6 +20,7 @@ from dotenv import load_dotenv
 from core.logger import IST, get_logger
 from core.pipeline import run_pipeline
 from core.prospect_csv import canonicalize_prospect_row
+from core.smtp_sender import send_seed_email
 
 load_dotenv()
 
@@ -78,7 +79,7 @@ def _load_sent() -> set[str]:
 def _append_log(row: dict) -> None:
     with _log_lock:
         with open(SENT_LOG_FILE, "a", newline="", encoding="utf-8") as f:
-            csv.DictWriter(f, fieldnames=_LOG_HEADERS).writerow(row)
+            csv.DictWriter(f, fieldnames=_LOG_HEADERS, extrasaction="ignore").writerow(row)
 
 
 def _load_prospects(path: str) -> list[dict]:
@@ -142,11 +143,14 @@ def main() -> None:
 
     counts: dict[str, int] = {}
     start_time = time.time()
+    sample_emails: list[dict] = []  # capture up to 2 full formatted emails for seed
 
     def _on_result(row: dict) -> None:
         _append_log(row)
         st = row["status"]
         counts[st] = counts.get(st, 0) + 1
+        if st == "pushed" and len(sample_emails) < 2:
+            sample_emails.append(row)
 
     def _on_progress(done: int, total_: int) -> None:
         if total_ == 0:
@@ -181,6 +185,35 @@ def main() -> None:
     )
     print(f"\n{summary}", flush=True)
     log.info(summary)
+
+    # ── Seed email to admin ────────────────────────────────────────────────
+    ts_label = datetime.now(tz=IST).strftime("%Y-%m-%d %H:%M IST")
+    dry_tag  = " [DRY RUN]" if args.dry_run else ""
+    seed_subject = f"[BD Outreach] Run complete{dry_tag} — {ts_label}"
+
+    seed_body = (
+        f"BD Outreach run completed{dry_tag}.\n\n"
+        f"File: {prospects_file}\n"
+        f"Total prospects: {len(all_prospects)}\n\n"
+        f"{summary}"
+    )
+
+    if sample_emails:
+        seed_body += "\n\n" + "=" * 50 + "\n"
+        seed_body += f"SAMPLE EMAILS SENT ({len(sample_emails)} of {counts.get('pushed', 0)} pushed)\n"
+        seed_body += "=" * 50
+        for i, s in enumerate(sample_emails, 1):
+            seed_body += (
+                f"\n\n── Sample {i} ──\n"
+                f"To:      {s['prospect_name']} <{s['prospect_email']}>\n"
+                f"From:    {s['from_email']}\n"
+                f"Company: {s['company']}\n"
+                f"Subject: {s['subject']}\n"
+                f"\n{s.get('body', '(body not captured)')}\n"
+                f"\n{'─' * 40}"
+            )
+
+    send_seed_email(seed_subject, seed_body)
 
 
 if __name__ == "__main__":

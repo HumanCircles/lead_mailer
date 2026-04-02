@@ -16,7 +16,7 @@ from core.email_drafter import draft_email
 from core.logger import IST
 from core.pipeline import SENT_LOG_FILE, run_pipeline
 from core.prospect_csv import detect_column_mapping, normalise_prospects_dataframe
-from core.smtp_sender import DAILY_LIMIT, HOURLY_LIMIT, _pool_lock, _sender_state, send_email
+from core.sendgrid_sender import DAILY_LIMIT, HOURLY_LIMIT, _pool_lock, _sender_state, send_email, send_seed_email
 
 # ── Page config ───────────────────────────────────────────────────────────────
 
@@ -363,7 +363,7 @@ with tab_outreach:
                 r = st.session_state.results[k]
                 try:
                     send_email(p["email"], r["subject"], r["body"], p.get("first_name", ""))
-                    st.session_state.results[k]["status"] = "sent"
+                    st.session_state.results[k]["status"] = "sent"  # noqa: unpack ignored
                     st.session_state.results[k]["error"] = ""
                 except Exception as e:
                     st.session_state.results[k]["status"] = "failed"
@@ -412,7 +412,7 @@ with tab_outreach:
                 stat.caption(f"[{i+1}/{len(unsent)}] Sending to {p['first_name']} {p['last_name']}…")
                 prog.progress(int((i + 1) / len(unsent) * 100))
                 try:
-                    send_email(p["email"], res["subject"], res["body"], p.get("first_name", ""))
+                    send_email(p["email"], res["subject"], res["body"], p.get("first_name", ""))  # returns (addr, body)
                     st.session_state.results[k]["status"] = "sent"
                 except Exception as e:
                     st.session_state.results[k]["status"] = "failed"
@@ -475,7 +475,7 @@ with tab_outreach:
                 if st.button("Send", type="primary", use_container_width=True, key=f"send_{k}"):
                     with st.spinner("Sending…"):
                         try:
-                            from_addr = send_email(p["email"], subj, body, p.get("first_name", ""))
+                            from_addr, _ = send_email(p["email"], subj, body, p.get("first_name", ""))
                             st.session_state.results[k]["status"] = "sent"
                             st.success(f"Sent via {from_addr}")
                         except Exception as e:
@@ -575,9 +575,7 @@ with tab_batch:
                             with open(SENT_LOG_FILE, "w", newline="", encoding="utf-8") as f:
                                 csv.DictWriter(f, fieldnames=_LOG_HEADERS).writeheader()
                         with open(SENT_LOG_FILE, "a", newline="", encoding="utf-8") as f:
-                            csv.DictWriter(f, fieldnames=_LOG_HEADERS).writerow(
-                                {h: row.get(h, "") for h in _LOG_HEADERS}
-                            )
+                            csv.DictWriter(f, fieldnames=_LOG_HEADERS, extrasaction="ignore").writerow(row)
                     except Exception:
                         pass
 
@@ -595,6 +593,23 @@ with tab_batch:
                         dry_run=dry_run_b,
                     )
                     st.session_state.batch_running = False
+
+                    # Seed email summary to admin
+                    log_rows = st.session_state.batch_log
+                    pushed  = sum(1 for r in log_rows if r.get("status") == "pushed")
+                    failed  = sum(1 for r in log_rows if r.get("status") == "failed_api")
+                    dry_tag = " [DRY RUN]" if dry_run_b else ""
+                    ts_label = datetime.now(tz=IST).strftime("%Y-%m-%d %H:%M IST")
+                    send_seed_email(
+                        subject=f"[BD Outreach UI] Batch complete{dry_tag} — {ts_label}",
+                        body=(
+                            f"Batch run completed via UI{dry_tag}.\n\n"
+                            f"Prospects loaded: {len(batch_prospects)}\n"
+                            f"Pushed: {pushed}\n"
+                            f"Failed: {failed}\n"
+                            f"Total processed: {len(log_rows)}\n"
+                        ),
+                    )
 
                 t = threading.Thread(target=_run_batch, daemon=True)
                 t.start()

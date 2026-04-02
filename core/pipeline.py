@@ -25,7 +25,7 @@ from dotenv import load_dotenv
 from core.deliverability import is_suppressed, strip_control_chars
 from core.email_drafter import draft_email
 from core.logger import get_logger
-from core.smtp_sender import (
+from core.sendgrid_sender import (
     DAILY_LIMIT,
     _hourly_safe_limit,
     _pool_lock,
@@ -53,6 +53,7 @@ def _make_log_row(
     status: str,
     error: str = "",
     from_email: str = "",
+    body: str = "",
 ) -> dict:
     return {
         "timestamp":      datetime.now(timezone.utc).isoformat(),
@@ -63,6 +64,7 @@ def _make_log_row(
         "status":         status,
         "error":          error,
         "from_email":     from_email,
+        "body":           body,   # full formatted body; not written to CSV (extrasaction ignored)
     }
 
 
@@ -151,8 +153,8 @@ def _send_phase(
 
         with sem:
             try:
-                from_addr = send_email(email, subject, body, prospect.get("first_name", ""))
-                row = _make_log_row(prospect, subject, "pushed", from_email=from_addr)
+                from_addr, body_sent = send_email(email, subject, body, prospect.get("first_name", ""))
+                row = _make_log_row(prospect, subject, "pushed", from_email=from_addr, body=body_sent)
             except Exception as e:
                 if is_siteground_hourly_lockout(e):
                     log.warning("SiteGround 550 lockout hit — putting draft back in queue")
