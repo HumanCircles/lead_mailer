@@ -82,16 +82,23 @@ def _format_body_for_plaintext(body: str) -> str:
 
 
 def draft_email(lead_data: dict) -> dict:
-    name     = strip_control_chars(str(lead_data.get("name", "") or ""))
-    company  = strip_control_chars(str(lead_data.get("company", "") or ""))
-    title    = strip_control_chars(str(lead_data.get("title", "") or ""))
-    platform = strip_control_chars(str(lead_data.get("hcm_platform", "") or company or ""))
+    name          = strip_control_chars(str(lead_data.get("name", "") or ""))
+    company       = strip_control_chars(str(lead_data.get("company", "") or ""))
+    title         = strip_control_chars(str(lead_data.get("title", "") or ""))
+    platform      = strip_control_chars(str(lead_data.get("hcm_platform", "") or company or ""))
+    research_note = strip_control_chars(str(lead_data.get("research_note", "") or ""))
+
+    research_block = (
+        f"\n- Research note (use this verbatim for Beat 1): {research_note}"
+        if research_note else
+        "\n- Research note: none — infer Beat 1 from their title, company, and platform context"
+    )
 
     prompt = f"""Prospect:
 - Name: {name}
 - Title: {title}
 - Company: {company}
-- Platform: {platform}
+- Platform: {platform}{research_block}
 
 Write the email following the playbook exactly. Return JSON only — no markdown, no preamble:
 {{

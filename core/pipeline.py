@@ -109,12 +109,13 @@ def _generate_one(
         return
     try:
         lead = {
-            "name":         strip_control_chars(
+            "name":          strip_control_chars(
                 f"{prospect.get('first_name', '')} {prospect.get('last_name', '')}".strip()
             ),
-            "company":      strip_control_chars(str(prospect.get("company", "") or "")),
-            "title":        strip_control_chars(str(prospect.get("title", "") or "")),
-            "hcm_platform": strip_control_chars(str(prospect.get("hcm_platform", "") or "")),
+            "company":       strip_control_chars(str(prospect.get("company", "") or "")),
+            "title":         strip_control_chars(str(prospect.get("title", "") or "")),
+            "hcm_platform":  strip_control_chars(str(prospect.get("hcm_platform", "") or "")),
+            "research_note": strip_control_chars(str(prospect.get("research_note", "") or "")),
         }
         ec = draft_email(lead)
         if dry_run:

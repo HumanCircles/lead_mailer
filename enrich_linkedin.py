@@ -1,0 +1,256 @@
+"""
+Enrich a prospects CSV with LinkedIn research notes for Beat 1 of the email playbook.
+
+For each prospect, fetches their LinkedIn profile via RapidAPI and extracts the most
+useful recent signal (latest post, headline, about summary) into a `research_note` field.
+The drafter then uses this to write a genuine, specific Beat 1 observation.
+
+Usage:
+    python enrich_linkedin.py --input data/main.csv --output prospects_enriched.csv
+    python enrich_linkedin.py --input prospects.csv --workers 5
+
+The script resumes automatically — already-enriched rows (non-empty research_note) are
+skipped unless --fresh is passed.
+"""
+
+from __future__ import annotations
+
+import argparse
+import csv
+import os
+import sys
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+import requests
+from dotenv import load_dotenv
+
+load_dotenv()
+
+RAPIDAPI_KEY  = os.getenv("RAPIDAPI_KEY")
+RAPIDAPI_HOST = "fresh-linkedin-profile-data.p.rapidapi.com"
+BASE_URL      = f"https://{RAPIDAPI_HOST}"
+
+HEADERS = {
+    "x-rapidapi-key":  RAPIDAPI_KEY,
+    "x-rapidapi-host": RAPIDAPI_HOST,
+}
+
+_print_lock = threading.Lock()
+
+
+# ── CLI ───────────────────────────────────────────────────────────────────────
+
+def _parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(description="Enrich prospects with LinkedIn research notes")
+    p.add_argument("--input",   "-i", default="prospects.csv",          help="Input CSV")
+    p.add_argument("--output",  "-o", default="prospects_enriched.csv", help="Output CSV")
+    p.add_argument("--workers", "-w", type=int, default=3,              help="Parallel API calls (default: 3)")
+    p.add_argument("--fresh",   action="store_true",                    help="Re-enrich all rows, even those with existing notes")
+    p.add_argument("--delay",   type=float, default=0.5,                help="Seconds between API calls per worker (default: 0.5)")
+    return p.parse_args()
+
+
+# ── LinkedIn URL normalisation ────────────────────────────────────────────────
+
+def _clean_linkedin_url(raw: str) -> str:
+    """Normalise to https://www.linkedin.com/in/slug form."""
+    url = (raw or "").strip().rstrip("/")
+    if not url or "linkedin.com" not in url:
+        return ""
+    if url.startswith("linkedin.com"):
+        url = "https://www." + url
+    elif url.startswith("www.linkedin.com"):
+        url = "https://" + url
+    elif not url.startswith("http"):
+        url = "https://www.linkedin.com/in/" + url.lstrip("/")
+    # Normalise http→https, linkedin.com → www.linkedin.com
+    url = url.replace("http://", "https://").replace("https://linkedin.com", "https://www.linkedin.com")
+    return url
+
+
+def _find_linkedin_url(row: dict) -> str:
+    """Try several common column name variants."""
+    candidates = [
+        "linkedin_url", "linkedin", "linkedInProfileUrl", "Person Linkedin Url",
+        "profileUrl", "defaultProfileUrl", "li_url", "LinkedIn URL",
+    ]
+    for col in candidates:
+        val = (row.get(col) or "").strip()
+        if val and "linkedin.com/in/" in val:
+            return _clean_linkedin_url(val)
+    return ""
+
+
+# ── RapidAPI calls ────────────────────────────────────────────────────────────
+
+def _fetch_by_url(linkedin_url: str) -> dict | None:
+    try:
+        resp = requests.get(
+            f"{BASE_URL}/get-profile-data-by-url",
+            headers=HEADERS,
+            params={"linkedin_url": linkedin_url},
+            timeout=15,
+        )
+        if resp.status_code == 200:
+            return resp.json()
+        if resp.status_code == 429:
+            time.sleep(5)
+        return None
+    except Exception:
+        return None
+
+
+def _search_by_name_company(first_name: str, last_name: str, company: str) -> dict | None:
+    """Search LinkedIn by name + company, return the first matching profile."""
+    keyword = f"{first_name} {last_name}".strip()
+    if not keyword:
+        return None
+    try:
+        resp = requests.get(
+            f"{BASE_URL}/search-employees",
+            headers=HEADERS,
+            params={"company_name": company or "", "keyword": keyword},
+            timeout=15,
+        )
+        if resp.status_code == 200:
+            data = resp.json()
+            employees = data.get("employees") or data.get("data") or []
+            if employees:
+                # Fetch full profile for the first result
+                profile_url = (employees[0].get("linkedin_url") or
+                               employees[0].get("profile_url") or "")
+                if profile_url:
+                    return _fetch_by_url(_clean_linkedin_url(profile_url))
+        return None
+    except Exception:
+        return None
+
+
+# ── Research note extraction ──────────────────────────────────────────────────
+
+def _extract_research_note(profile: dict) -> str:
+    """
+    Pull the most useful Beat-1 signal from a LinkedIn profile response.
+    Priority: latest post → about/summary → headline.
+    Returns a short, factual string the LLM can reference verbatim.
+    """
+    if not profile:
+        return ""
+
+    # 1. Latest post (strongest Beat-1 material)
+    posts = profile.get("posts") or profile.get("recent_posts") or []
+    if posts:
+        post = posts[0]
+        text = (post.get("text") or post.get("content") or "").strip()
+        if text and len(text) > 30:
+            snippet = text[:280].rsplit(" ", 1)[0]  # cut at word boundary
+            return f"Recent LinkedIn post: \"{snippet}...\""
+
+    # 2. About / summary
+    about = (profile.get("about") or profile.get("summary") or "").strip()
+    if about and len(about) > 40:
+        snippet = about[:240].rsplit(" ", 1)[0]
+        return f"LinkedIn about: \"{snippet}...\""
+
+    # 3. Headline fallback
+    headline = (profile.get("headline") or "").strip()
+    if headline:
+        return f"LinkedIn headline: \"{headline}\""
+
+    return ""
+
+
+# ── Per-row enrichment ────────────────────────────────────────────────────────
+
+def enrich_row(row: dict, delay: float = 0.5) -> dict:
+    """Enrich one prospect row. Returns the row with `research_note` set."""
+    first  = (row.get("first_name") or "").strip()
+    last   = (row.get("last_name")  or "").strip()
+    company = (row.get("company")   or "").strip()
+
+    li_url  = _find_linkedin_url(row)
+    profile = None
+
+    if li_url:
+        profile = _fetch_by_url(li_url)
+    if profile is None and (first or last):
+        profile = _search_by_name_company(first, last, company)
+
+    note = _extract_research_note(profile) if profile else ""
+    time.sleep(delay)
+
+    enriched = dict(row)
+    enriched["research_note"] = note
+    return enriched
+
+
+# ── Main ──────────────────────────────────────────────────────────────────────
+
+def main() -> None:
+    args = _parse_args()
+
+    with open(args.input, newline="", encoding="utf-8-sig") as f:
+        rows = list(csv.DictReader(f))
+
+    if not rows:
+        print("Input CSV is empty.")
+        sys.exit(0)
+
+    # Ensure research_note column exists
+    for r in rows:
+        r.setdefault("research_note", "")
+
+    fieldnames = list(rows[0].keys())
+    if "research_note" not in fieldnames:
+        fieldnames.append("research_note")
+
+    # Skip already-enriched rows unless --fresh
+    pending_idx = [
+        i for i, r in enumerate(rows)
+        if args.fresh or not r.get("research_note", "").strip()
+    ]
+
+    print(f"Total rows  : {len(rows)}")
+    print(f"To enrich   : {len(pending_idx)}  (already done: {len(rows) - len(pending_idx)})")
+    print(f"Workers     : {args.workers}  |  delay: {args.delay}s per call")
+    print()
+
+    if not pending_idx:
+        print("Nothing to enrich. Pass --fresh to re-enrich all rows.")
+    else:
+        done_n = [0]
+        lock   = threading.Lock()
+
+        def _work(i: int) -> tuple[int, dict]:
+            enriched = enrich_row(rows[i], delay=args.delay)
+            return i, enriched
+
+        with ThreadPoolExecutor(max_workers=args.workers) as pool:
+            futures = {pool.submit(_work, i): i for i in pending_idx}
+            for fut in as_completed(futures):
+                i, enriched = fut.result()
+                rows[i] = enriched
+                with lock:
+                    done_n[0] += 1
+                    note_short = (enriched.get("research_note") or "")[:60]
+                    name = f"{enriched.get('first_name','')} {enriched.get('last_name','')}".strip()
+                    with _print_lock:
+                        print(
+                            f"[{done_n[0]:>4}/{len(pending_idx)}]  {name:<30}  "
+                            + (f'"{note_short}..."' if note_short else "(no note found)")
+                        )
+
+    with open(args.output, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
+        writer.writeheader()
+        writer.writerows(rows)
+
+    enriched_count = sum(1 for r in rows if r.get("research_note", "").strip())
+    print(f"\nEnriched rows with notes: {enriched_count}/{len(rows)}")
+    print(f"Saved → {args.output}")
+
+
+if __name__ == "__main__":
+    main()

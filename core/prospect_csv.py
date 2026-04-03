@@ -93,14 +93,16 @@ def canonicalize_prospect_row(row: dict) -> dict[str, str]:
         "current company",
     )
     title = _first_non_empty(m, "title", "current position", "job title", "current title", "position")
-    hcm_platform = _first_non_empty(m, "hcm_platform", "hcm platform", "platform")
+    hcm_platform  = _first_non_empty(m, "hcm_platform", "hcm platform", "platform")
+    research_note = _first_non_empty(m, "research_note", "research note", "linkedin_note", "note")
     return {
-        "first_name": first_name,
-        "last_name": last_name,
-        "email": email,
-        "company": company,
-        "title": title,
-        "hcm_platform": hcm_platform,
+        "first_name":    first_name,
+        "last_name":     last_name,
+        "email":         email,
+        "company":       company,
+        "title":         title,
+        "hcm_platform":  hcm_platform,
+        "research_note": research_note,
     }
 
 

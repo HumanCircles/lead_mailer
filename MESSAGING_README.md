@@ -70,22 +70,22 @@ Close with a direct invitation for a discussion. Frame it as the CEO and sender 
 ## 3. Subject Line Formula
 
 ```
-Invite for discussion | [3-4 word hook on their specific pain point]
+[3-5 word hook on their specific pain point]
 ```
 
 The hook should name the problem, not the solution. It should be specific enough that only someone who has that problem would open it.
 
 **Examples:**
 ```
-Invite for discussion | sourcing gap in enterprise ATS
-Invite for discussion | technical hiring outside the platform
-Invite for discussion | last-mile compliance in SMB payroll
-Invite for discussion | agent layer for Flex Credit utility
+Sourcing Gap in Enterprise ATS
+Technical Hiring Outside the Platform
+Last-Mile Compliance in SMB Payroll
+Candidate Pipeline Visibility in Workday
 ```
 
 **Rules:**
-- Always start with "Invite for discussion |". It is direct and signals peer-level intent.
-- The hook is 3-4 words, no more
+- Lead directly with the hook. Do NOT use a prefix like "Invite for discussion |" — it is a visible formula that recipients recognise as a mass template and spam filters flag it.
+- 3-5 words, title case
 - Name the problem domain, not your product
 - No question marks, exclamation points, or personalization tokens in the subject line
 
