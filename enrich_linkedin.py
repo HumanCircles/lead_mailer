@@ -8,6 +8,8 @@ The drafter then uses this to write a genuine, specific Beat 1 observation.
 Usage:
     python enrich_linkedin.py --input data/main.csv --output prospects_enriched.csv
     python enrich_linkedin.py --input prospects.csv --workers 5
+    # Fast run (typical 2–4× wall-clock vs defaults; fewer fallbacks / fewer API calls):
+    python enrich_linkedin.py -i prospects.csv -o out.csv --fast --workers 16
 
 The script resumes automatically — already-enriched rows (non-empty research_note) are
 skipped unless --fresh is passed.
@@ -38,6 +40,17 @@ HEADERS = {
 }
 
 _print_lock = threading.Lock()
+# One requests.Session per worker thread (connection reuse; faster than bare requests.get).
+_tls_session = threading.local()
+
+
+def _http() -> requests.Session:
+    s = getattr(_tls_session, "session", None)
+    if s is None:
+        s = requests.Session()
+        s.headers.update(HEADERS)
+        _tls_session.session = s
+    return s
 
 
 # ── CLI ───────────────────────────────────────────────────────────────────────
@@ -54,6 +67,26 @@ def _parse_args() -> argparse.Namespace:
         type=int,
         default=25,
         help="Persist output every N completed rows (default: 25, 0 = end only)",
+    )
+    p.add_argument(
+        "--fast",
+        action="store_true",
+        help="Speed preset: --skip-google --delay 0 (still use --workers for concurrency)",
+    )
+    p.add_argument(
+        "--skip-google",
+        action="store_true",
+        help="Skip Google URL discovery (tier 3); RapidAPI only",
+    )
+    p.add_argument(
+        "--skip-search",
+        action="store_true",
+        help="Skip name+company employee search (tier 2); LinkedIn URL column only",
+    )
+    p.add_argument(
+        "--skip-posts",
+        action="store_true",
+        help="Skip get-profile-posts; only enrich-lead (half the API calls per URL)",
     )
     return p.parse_args()
 
@@ -94,9 +127,8 @@ def _find_linkedin_url(row: dict) -> str:
 def _api_get(endpoint: str, params: dict) -> dict | None:
     """GET any RapidAPI endpoint, unwrap {"data": ..., "message": "ok"} envelope."""
     try:
-        resp = requests.get(
+        resp = _http().get(
             f"{BASE_URL}/{endpoint}",
-            headers=HEADERS,
             params=params,
             timeout=15,
         )
@@ -110,7 +142,7 @@ def _api_get(endpoint: str, params: dict) -> dict | None:
         return None
 
 
-def _fetch_by_url(linkedin_url: str) -> dict | None:
+def _fetch_by_url(linkedin_url: str, *, skip_posts: bool = False) -> dict | None:
     """
     Fetch profile + latest post for a LinkedIn URL.
     Makes two API calls:
@@ -128,6 +160,9 @@ def _fetch_by_url(linkedin_url: str) -> dict | None:
     })
     if profile is None:
         profile = {}
+
+    if skip_posts:
+        return profile if profile else None
 
     # Speed path: if enrich-lead already yields a usable signal
     # (about/headline/skills/publications/awards), avoid a second API call.
@@ -147,15 +182,16 @@ def _fetch_by_url(linkedin_url: str) -> dict | None:
     return profile if profile else None
 
 
-def _search_by_name_company(first_name: str, last_name: str, company: str) -> dict | None:
+def _search_by_name_company(
+    first_name: str, last_name: str, company: str, *, skip_posts: bool = False
+) -> dict | None:
     """Search LinkedIn via RapidAPI by name + company."""
     keyword = f"{first_name} {last_name}".strip()
     if not keyword:
         return None
     try:
-        resp = requests.get(
+        resp = _http().get(
             f"{BASE_URL}/search-employees",
-            headers=HEADERS,
             params={"company_name": company or "", "keyword": keyword},
             timeout=15,
         )
@@ -166,7 +202,9 @@ def _search_by_name_company(first_name: str, last_name: str, company: str) -> di
                 profile_url = (employees[0].get("linkedin_url") or
                                employees[0].get("profile_url") or "")
                 if profile_url:
-                    return _fetch_by_url(_clean_linkedin_url(profile_url))
+                    return _fetch_by_url(
+                        _clean_linkedin_url(profile_url), skip_posts=skip_posts
+                    )
         return None
     except Exception:
         return None
@@ -191,6 +229,7 @@ def _google_find_linkedin_url(first_name: str, last_name: str,
     query = " ".join(p for p in parts if p)
 
     try:
+        # Do not use RapidAPI Session headers on third-party hosts
         search_resp = requests.get(
             "https://www.google.com/search",
             params={"q": query, "num": 3},
@@ -280,7 +319,14 @@ def _extract_research_note(profile: dict) -> str:
 
 # ── Per-row enrichment ────────────────────────────────────────────────────────
 
-def enrich_row(row: dict, delay: float = 0.5) -> dict:
+def enrich_row(
+    row: dict,
+    delay: float = 0.5,
+    *,
+    skip_google: bool = False,
+    skip_search: bool = False,
+    skip_posts: bool = False,
+) -> dict:
     """
     Enrich one prospect row with a LinkedIn research note.
 
@@ -301,19 +347,21 @@ def enrich_row(row: dict, delay: float = 0.5) -> dict:
     # Tier 1 — direct URL
     if li_url:
         did_lookup = True
-        profile = _fetch_by_url(li_url)
+        profile = _fetch_by_url(li_url, skip_posts=skip_posts)
 
     # Tier 2 — RapidAPI name+company search
-    if profile is None and (first or last):
+    if profile is None and (first or last) and not skip_search:
         did_lookup = True
-        profile = _search_by_name_company(first, last, company)
+        profile = _search_by_name_company(
+            first, last, company, skip_posts=skip_posts
+        )
 
     # Tier 3 — Google to discover the URL, then fetch profile
-    if profile is None:
+    if profile is None and not skip_google:
         discovered_url = _google_find_linkedin_url(first, last, company, email)
         if discovered_url:
             did_lookup = True
-            profile = _fetch_by_url(discovered_url)
+            profile = _fetch_by_url(discovered_url, skip_posts=skip_posts)
 
     note = _extract_research_note(profile) if profile else ""
     if did_lookup and delay > 0:
@@ -335,6 +383,9 @@ def _write_output(path: str, fieldnames: list[str], rows: list[dict]) -> None:
 
 def main() -> None:
     args = _parse_args()
+    if args.fast:
+        args.skip_google = True
+        args.delay = 0.0
 
     with open(args.input, newline="", encoding="utf-8-sig") as f:
         rows = list(csv.DictReader(f))
@@ -359,7 +410,11 @@ def main() -> None:
 
     print(f"Total rows  : {len(rows)}")
     print(f"To enrich   : {len(pending_idx)}  (already done: {len(rows) - len(pending_idx)})")
-    print(f"Workers     : {args.workers}  |  delay: {args.delay}s per call")
+    print(
+        f"Workers     : {args.workers}  |  delay: {args.delay}s  |  "
+        f"skip_google={args.skip_google}  skip_search={args.skip_search}  "
+        f"skip_posts={args.skip_posts}"
+    )
     print()
 
     if not pending_idx:
@@ -371,7 +426,13 @@ def main() -> None:
         checkpoint_every = max(0, args.checkpoint_every)
 
         def _work(i: int) -> tuple[int, dict]:
-            enriched = enrich_row(rows[i], delay=args.delay)
+            enriched = enrich_row(
+                rows[i],
+                delay=args.delay,
+                skip_google=args.skip_google,
+                skip_search=args.skip_search,
+                skip_posts=args.skip_posts,
+            )
             return i, enriched
 
         with ThreadPoolExecutor(max_workers=args.workers) as pool:
