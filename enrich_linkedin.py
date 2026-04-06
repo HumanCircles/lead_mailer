@@ -85,16 +85,18 @@ def _find_linkedin_url(row: dict) -> str:
 
 # ── RapidAPI calls ────────────────────────────────────────────────────────────
 
-def _fetch_by_url(linkedin_url: str) -> dict | None:
+def _api_get(endpoint: str, params: dict) -> dict | None:
+    """GET any RapidAPI endpoint, unwrap {"data": ..., "message": "ok"} envelope."""
     try:
         resp = requests.get(
-            f"{BASE_URL}/get-profile-data-by-url",
+            f"{BASE_URL}/{endpoint}",
             headers=HEADERS,
-            params={"linkedin_url": linkedin_url},
+            params=params,
             timeout=15,
         )
         if resp.status_code == 200:
-            return resp.json()
+            body = resp.json()
+            return body.get("data") or body
         if resp.status_code == 429:
             time.sleep(5)
         return None
@@ -102,8 +104,42 @@ def _fetch_by_url(linkedin_url: str) -> dict | None:
         return None
 
 
+def _fetch_by_url(linkedin_url: str) -> dict | None:
+    """
+    Fetch profile + latest post for a LinkedIn URL.
+    Makes two API calls:
+      1. /enrich-lead          → awards, publications, about, skills, headline
+      2. /get-profile-posts    → most recent post text (strongest Beat-1 signal)
+
+    Returns a merged dict so _extract_research_note can pick the best signal.
+    """
+    profile = _api_get("enrich-lead", {
+        "linkedin_url":               linkedin_url,
+        "include_skills":             "true",
+        "include_certifications":     "false",
+        "include_profile_status":     "false",
+        "include_company_public_url": "false",
+    })
+
+    # Fetch latest post separately — returns a list of posts under "data"
+    post_data = _api_get("get-profile-posts", {
+        "linkedin_url": linkedin_url,
+        "type":         "posts",
+    })
+
+    # Merge: inject most recent post into profile dict
+    if profile is None:
+        profile = {}
+    if post_data:
+        first_post = post_data[0] if isinstance(post_data, list) else post_data
+        if isinstance(first_post, dict) and first_post.get("text"):
+            profile["_latest_post"] = first_post
+
+    return profile if profile else None
+
+
 def _search_by_name_company(first_name: str, last_name: str, company: str) -> dict | None:
-    """Search LinkedIn by name + company, return the first matching profile."""
+    """Search LinkedIn via RapidAPI by name + company."""
     keyword = f"{first_name} {last_name}".strip()
     if not keyword:
         return None
@@ -118,7 +154,6 @@ def _search_by_name_company(first_name: str, last_name: str, company: str) -> di
             data = resp.json()
             employees = data.get("employees") or data.get("data") or []
             if employees:
-                # Fetch full profile for the first result
                 profile_url = (employees[0].get("linkedin_url") or
                                employees[0].get("profile_url") or "")
                 if profile_url:
@@ -128,33 +163,105 @@ def _search_by_name_company(first_name: str, last_name: str, company: str) -> di
         return None
 
 
+def _google_find_linkedin_url(first_name: str, last_name: str,
+                               company: str, email: str) -> str:
+    """
+    Tier-3 fallback: Google search to discover a LinkedIn profile URL.
+
+    Uses the email domain as an extra signal (e.g. hirequotient.com) to
+    narrow results without needing a last name.
+    Returns a linkedin.com/in/... URL string, or "".
+    """
+    import re as _re
+    name    = f"{first_name} {last_name}".strip()
+    domain  = email.split("@")[-1] if "@" in email else ""
+    # Build a tight Google query
+    parts = [f'site:linkedin.com/in', f'"{name}"' if name else "", f'"{company}"' if company else ""]
+    if domain and domain not in ("gmail.com", "yahoo.com", "hotmail.com", "outlook.com"):
+        parts.append(domain)
+    query = " ".join(p for p in parts if p)
+
+    try:
+        search_resp = requests.get(
+            "https://www.google.com/search",
+            params={"q": query, "num": 3},
+            headers={"User-Agent": "Mozilla/5.0 (compatible; enrichbot/1.0)"},
+            timeout=10,
+        )
+        if search_resp.status_code != 200:
+            return ""
+        # Extract linkedin.com/in/slug URLs from response HTML
+        urls = _re.findall(
+            r'linkedin\.com/in/([\w\-]+)',
+            search_resp.text,
+        )
+        if urls:
+            slug = urls[0]
+            return f"https://www.linkedin.com/in/{slug}"
+    except Exception:
+        pass
+    return ""
+
+
 # ── Research note extraction ──────────────────────────────────────────────────
 
 def _extract_research_note(profile: dict) -> str:
     """
-    Pull the most useful Beat-1 signal from a LinkedIn profile response.
-    Priority: latest post → about/summary → headline.
-    Returns a short, factual string the LLM can reference verbatim.
+    Pull the most useful Beat-1 signal from a LinkedIn /enrich-lead response.
+
+    Priority:
+      1. Latest post         — what they're actively thinking about right now
+      2. Recent publication  — establishes thought-leadership angle
+      3. Top award           — strong credibility anchor
+      4. About / summary     — their own framing of what they do
+      5. Top skills          — professional focus areas
+      6. Headline            — last resort fallback
     """
     if not profile:
         return ""
 
-    # 1. Latest post (strongest Beat-1 material)
-    posts = profile.get("posts") or profile.get("recent_posts") or []
-    if posts:
-        post = posts[0]
-        text = (post.get("text") or post.get("content") or "").strip()
-        if text and len(text) > 30:
-            snippet = text[:280].rsplit(" ", 1)[0]  # cut at word boundary
-            return f"Recent LinkedIn post: \"{snippet}...\""
+    # 1. Latest post (from /get-profile-posts — strongest Beat-1 signal)
+    post = profile.get("_latest_post") or {}
+    post_text = (post.get("text") or "").strip()
+    if post_text and len(post_text) > 30:
+        snippet   = post_text[:280].rsplit(" ", 1)[0]
+        posted_on = (post.get("posted") or "")[:10]   # "2025-04-09"
+        date_tag  = f" ({posted_on})" if posted_on else ""
+        return f"Recent LinkedIn post{date_tag}: \"{snippet}...\""
 
-    # 2. About / summary
+    # 2. Most recent publication
+    pubs = profile.get("publications") or []
+    if pubs:
+        pub = pubs[0] if isinstance(pubs[0], str) else (pubs[0].get("title") or "")
+        if pub:
+            return f"Published: \"{pub}\""
+
+    # 3. Top award
+    awards = profile.get("awards") or []
+    if awards:
+        award = awards[0] if isinstance(awards[0], str) else (awards[0].get("title") or "")
+        if award:
+            return f"Award: \"{award}\""
+
+    # 4. About / summary
     about = (profile.get("about") or profile.get("summary") or "").strip()
     if about and len(about) > 40:
-        snippet = about[:240].rsplit(" ", 1)[0]
-        return f"LinkedIn about: \"{snippet}...\""
+        return f"LinkedIn about: \"{about[:240].rsplit(' ', 1)[0]}...\""
 
-    # 3. Headline fallback
+    # 5. Top skills — API returns either a plain string or a list of strings/dicts
+    skills_raw = profile.get("skills") or []
+    if isinstance(skills_raw, str):
+        skill_names = [s.strip() for s in skills_raw.split(",") if s.strip()]
+    else:
+        skill_names = [
+            (s if isinstance(s, str) else s.get("name") or s.get("title") or "")
+            for s in skills_raw
+        ]
+        skill_names = [s for s in skill_names if s]
+    if skill_names:
+        return f"Top skills: {', '.join(skill_names[:5])}"
+
+    # 6. Headline
     headline = (profile.get("headline") or "").strip()
     if headline:
         return f"LinkedIn headline: \"{headline}\""
@@ -165,18 +272,35 @@ def _extract_research_note(profile: dict) -> str:
 # ── Per-row enrichment ────────────────────────────────────────────────────────
 
 def enrich_row(row: dict, delay: float = 0.5) -> dict:
-    """Enrich one prospect row. Returns the row with `research_note` set."""
-    first  = (row.get("first_name") or "").strip()
-    last   = (row.get("last_name")  or "").strip()
-    company = (row.get("company")   or "").strip()
+    """
+    Enrich one prospect row with a LinkedIn research note.
+
+    Three-tier fallback:
+      1. LinkedIn URL from CSV  →  direct profile fetch (fastest, most accurate)
+      2. Name + company         →  RapidAPI employee search (costs API credits)
+      3. Google search          →  find LinkedIn slug from name + email domain (free, slower)
+    """
+    first   = (row.get("first_name") or "").strip()
+    last    = (row.get("last_name")  or "").strip()
+    company = (row.get("company")    or "").strip()
+    email   = (row.get("email")      or "").strip()
 
     li_url  = _find_linkedin_url(row)
     profile = None
 
+    # Tier 1 — direct URL
     if li_url:
         profile = _fetch_by_url(li_url)
+
+    # Tier 2 — RapidAPI name+company search
     if profile is None and (first or last):
         profile = _search_by_name_company(first, last, company)
+
+    # Tier 3 — Google to discover the URL, then fetch profile
+    if profile is None:
+        discovered_url = _google_find_linkedin_url(first, last, company, email)
+        if discovered_url:
+            profile = _fetch_by_url(discovered_url)
 
     note = _extract_research_note(profile) if profile else ""
     time.sleep(delay)

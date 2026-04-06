@@ -106,6 +106,8 @@ def _load_prospects(path: str) -> list[dict]:
 def _parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="BD Outreach batch agent")
     p.add_argument("--dry-run", action="store_true", help="Generate emails but do not send")
+    p.add_argument("--preview-file", default="dry_run_preview.csv", metavar="PATH",
+                   help="CSV to save generated emails when using --dry-run (default: dry_run_preview.csv)")
     p.add_argument("--limit", type=int, default=0, metavar="N",
                    help="Process at most N prospects (0 = all)")
     p.add_argument("--file", default="", metavar="PATH",
@@ -159,7 +161,8 @@ def main() -> None:
 
     counts: dict[str, int] = {}
     start_time = time.time()
-    sample_emails: list[dict] = []  # capture up to 2 full formatted emails for seed
+    sample_emails: list[dict] = []   # capture up to 2 full formatted emails for seed
+    preview_rows: list[dict] = []    # dry-run: all generated emails with full body
 
     def _on_result(row: dict) -> None:
         _append_log(row)
@@ -167,6 +170,8 @@ def main() -> None:
         counts[st] = counts.get(st, 0) + 1
         if st == "pushed" and len(sample_emails) < 2:
             sample_emails.append(row)
+        if st == "dry_run":
+            preview_rows.append(row)
 
     def _on_progress(done: int, total_: int) -> None:
         if total_ == 0:
@@ -188,6 +193,15 @@ def main() -> None:
         stop_event=_stop_event,
         dry_run=args.dry_run,
     )
+
+    # ── Save dry-run preview CSV ───────────────────────────────────────────
+    if args.dry_run and preview_rows:
+        preview_headers = ["prospect_name", "prospect_email", "company", "subject", "body"]
+        with open(args.preview_file, "w", newline="", encoding="utf-8") as f:
+            w = csv.DictWriter(f, fieldnames=preview_headers, extrasaction="ignore")
+            w.writeheader()
+            w.writerows(preview_rows)
+        print(f"\nPreview saved → {args.preview_file}  ({len(preview_rows)} emails)", flush=True)
 
     elapsed = time.time() - start_time
     summary = (

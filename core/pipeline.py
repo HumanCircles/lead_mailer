@@ -119,7 +119,7 @@ def _generate_one(
         }
         ec = draft_email(lead)
         if dry_run:
-            on_result(_make_log_row(prospect, ec.get("subject", ""), "dry_run"))
+            on_result(_make_log_row(prospect, ec.get("subject", ""), "dry_run", body=ec.get("body", "")))
         else:
             # Use a timeout loop so stop_event can interrupt a full queue
             while not stop_event.is_set():

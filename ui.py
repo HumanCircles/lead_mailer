@@ -57,6 +57,7 @@ REQUIRED_COLS = {"first_name", "last_name", "email", "company", "title"}
 OPTIONAL_COLS = {"hcm_platform"}
 INBOX_CSV     = "inbox_replies.csv"
 INBOX_FIELDS  = ["inbox", "from", "subject", "date", "body"]
+DRY_RUN_PREVIEW_FILE = "dry_run_preview.csv"
 
 _LOG_HEADERS = [
     "timestamp", "prospect_email", "prospect_name",
@@ -214,6 +215,18 @@ def _load_inbox_csv() -> pd.DataFrame:
         return pd.read_csv(INBOX_CSV, dtype=str, keep_default_na=False)
     except Exception:
         return pd.DataFrame(columns=INBOX_FIELDS)
+
+
+def _save_dry_run_preview(rows: list[dict], path: str) -> int:
+    preview_rows = [r for r in rows if r.get("status") == "dry_run"]
+    if not preview_rows:
+        return 0
+    preview_headers = ["prospect_name", "prospect_email", "company", "subject", "body"]
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        w = csv.DictWriter(f, fieldnames=preview_headers, extrasaction="ignore")
+        w.writeheader()
+        w.writerows(preview_rows)
+    return len(preview_rows)
 
 
 # ── Sidebar ───────────────────────────────────────────────────────────────────
@@ -759,6 +772,13 @@ with tab_batch:
 
         col_start, col_stop, col_dryrun = st.columns([2, 1, 1])
         dry_run_b = col_dryrun.checkbox("Dry run (no send)", key="batch_dryrun")
+        preview_file_b = st.text_input(
+            "Dry-run preview file",
+            value=DRY_RUN_PREVIEW_FILE,
+            disabled=not dry_run_b,
+            key="batch_preview_file",
+            help="When dry run is enabled, generated emails are saved here (subject + full body).",
+        )
 
         with col_start:
             start_disabled = st.session_state.batch_running or not pending_b
@@ -809,17 +829,55 @@ with tab_batch:
                     log_rows = st.session_state.batch_log
                     pushed   = sum(1 for r in log_rows if r.get("status") == "pushed")
                     failed   = sum(1 for r in log_rows if r.get("status") == "failed_api")
+                    dry_cnt  = sum(1 for r in log_rows if r.get("status") == "dry_run")
+                    skip_sup = sum(1 for r in log_rows if r.get("status") == "skipped_suppressed")
+                    skip_dup = sum(1 for r in log_rows if r.get("status") == "skipped_duplicate")
+                    fail_gen = sum(1 for r in log_rows if r.get("status") == "failed_generation")
                     dry_tag  = " [DRY RUN]" if dry_run_b else ""
                     ts_label = datetime.now(tz=IST).strftime("%Y-%m-%d %H:%M IST")
+
+                    preview_saved = 0
+                    preview_path = (preview_file_b or DRY_RUN_PREVIEW_FILE).strip() or DRY_RUN_PREVIEW_FILE
+                    if dry_run_b:
+                        try:
+                            preview_saved = _save_dry_run_preview(log_rows, preview_path)
+                        except Exception:
+                            preview_saved = 0
+
+                    sample_emails = [r for r in log_rows if r.get("status") == "pushed"][:2]
+                    summary = (
+                        f"Done — pushed: {pushed}, dry_run: {dry_cnt}, "
+                        f"skipped_suppressed: {skip_sup}, skipped_duplicate: {skip_dup}, "
+                        f"failed_generation: {fail_gen}, failed_api: {failed}"
+                    )
+
+                    seed_body = (
+                        f"Batch run completed via UI{dry_tag}.\n\n"
+                        f"Prospects loaded: {len(batch_prospects)}\n"
+                        f"Total processed: {len(log_rows)}\n\n"
+                        f"{summary}"
+                    )
+                    if dry_run_b and preview_saved:
+                        seed_body += f"\n\nPreview saved → {preview_path}  ({preview_saved} emails)"
+
+                    if sample_emails:
+                        seed_body += "\n\n" + "=" * 50 + "\n"
+                        seed_body += f"SAMPLE EMAILS SENT ({len(sample_emails)} of {pushed} pushed)\n"
+                        seed_body += "=" * 50
+                        for i, s in enumerate(sample_emails, 1):
+                            seed_body += (
+                                f"\n\n-- Sample {i} --\n"
+                                f"To:      {s.get('prospect_name', '')} <{s.get('prospect_email', '')}>\n"
+                                f"From:    {s.get('from_email', '')}\n"
+                                f"Company: {s.get('company', '')}\n"
+                                f"Subject: {s.get('subject', '')}\n"
+                                f"\n{s.get('body', '(body not captured)')}\n"
+                                f"\n{'-' * 40}"
+                            )
+
                     send_seed_email(
                         subject=f"[BD Outreach UI] Batch complete{dry_tag} — {ts_label}",
-                        body=(
-                            f"Batch run completed via UI{dry_tag}.\n\n"
-                            f"Prospects loaded: {len(batch_prospects)}\n"
-                            f"Pushed: {pushed}\n"
-                            f"Failed: {failed}\n"
-                            f"Total processed: {len(log_rows)}\n"
-                        ),
+                        body=seed_body,
                     )
 
                 t = threading.Thread(target=_run_batch, daemon=True)
