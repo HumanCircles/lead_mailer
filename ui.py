@@ -268,6 +268,17 @@ def _load_pool_with_passwords() -> list[tuple[str, str]]:
     return pairs
 
 
+def _pool_domains(pairs: list[tuple[str, str]]) -> list[str]:
+    """Sorted unique domains from sender pool."""
+    d = sorted({e.split("@", 1)[-1].lower() for e, _ in pairs if "@" in e})
+    return d
+
+
+def _pool_emails_sorted(pairs: list[tuple[str, str]]) -> list[str]:
+    """Sorted sender emails (lowercase sort) from pool."""
+    return sorted((e.strip() for e, _ in pairs if "@" in e), key=str.lower)
+
+
 def _load_inbox_csv() -> pd.DataFrame:
     return _load_inbox_csv_path(INBOX_CSV)
 
@@ -1028,9 +1039,9 @@ with tab_batch:
 with tab_inbox:
     st.markdown("# Inbox")
     st.caption(
-        "IMAP fetch (snippet bodies), optional domain filter, then clean bounces, "
-        "then full-body re-fetch — mirrors `fetch_inboxes.py`, `clean_inboxes.py`, "
-        "`fetch_full_real_replies.py`."
+        "IMAP fetch (snippet bodies), filter by domain or specific sender emails, "
+        "then clean bounces, then full-body re-fetch — mirrors `fetch_inboxes.py`, "
+        "`clean_inboxes.py`, `fetch_full_real_replies.py`."
     )
 
     # ── 1) IMAP fetch ─────────────────────────────────────────────────────────
@@ -1053,6 +1064,46 @@ with tab_inbox:
                 "Workers", min_value=5, max_value=50, value=30, step=5, key="inbox_workers"
             )
 
+        _pool_pairs_preview = _load_pool_with_passwords()
+        _dom_options = _pool_domains(_pool_pairs_preview)
+        _email_options = _pool_emails_sorted(_pool_pairs_preview)
+
+        inbox_filter_mode = st.radio(
+            "Accounts to fetch",
+            ["All senders in SENDER_POOL", "By domain(s)", "By email address(es)"],
+            horizontal=True,
+            key="inbox_filter_mode",
+            help="Limit IMAP to specific domains or exact mailbox addresses from your pool.",
+        )
+
+        if inbox_filter_mode == "By domain(s)":
+            inbox_sel_domains = st.multiselect(
+                "Domains",
+                options=_dom_options,
+                default=[],
+                key="inbox_sel_domains",
+                help="Only fetch inboxes for @addresses on these domains.",
+            )
+        elif inbox_filter_mode == "By email address(es)":
+            inbox_sel_emails = st.multiselect(
+                "Sender emails",
+                options=_email_options,
+                default=[],
+                key="inbox_sel_emails",
+                help="Only these mailboxes (must exist in SENDER_POOL with passwords).",
+            )
+            inbox_extra_emails = st.text_area(
+                "Or paste emails (one per line)",
+                placeholder="sender1@the-easygrowth.us\nsender2@the-easygrowth.us",
+                height=88,
+                key="inbox_extra_emails",
+                help="Merged with multiselect above; must match an address in SENDER_POOL.",
+            )
+        else:
+            inbox_sel_domains = []
+            inbox_sel_emails = []
+            inbox_extra_emails = ""
+
         ocol1, ocol2, ocol3 = st.columns([2, 2, 2])
         with ocol1:
             inbox_out_csv = st.text_input(
@@ -1062,12 +1113,9 @@ with tab_inbox:
                 key="inbox_output_csv",
             )
         with ocol2:
-            inbox_domain_only = st.text_input(
-                "Only domain (optional)",
-                placeholder="the-easygrowth.us",
-                help="Leave empty to use every address in SENDER_POOL.",
-                key="inbox_domain_only",
-            )
+            st.caption("**Pool:** "
+                       f"{len(_pool_pairs_preview)} account(s), "
+                       f"{len(_dom_options)} domain(s)")
         with ocol3:
             inbox_fresh = st.checkbox(
                 "Overwrite output (fresh)",
@@ -1094,15 +1142,52 @@ with tab_inbox:
                 key="inbox_start",
             ):
                 pool_pairs = _load_pool_with_passwords()
-                dom = (inbox_domain_only or "").strip().lower()
-                if dom:
-                    pool_pairs = [
-                        (e, p) for e, p in pool_pairs
-                        if e.split("@", 1)[-1].lower() == dom
-                    ]
+                mode = st.session_state.get("inbox_filter_mode", "All senders in SENDER_POOL")
+                fetch_aborted = False
+
+                if mode == "By domain(s)":
+                    sel_dom = st.session_state.get("inbox_sel_domains") or []
+                    if not sel_dom:
+                        st.error("Select at least one domain, or switch to “All senders”.")
+                        fetch_aborted = True
+                    else:
+                        want_dom = {d.strip().lower() for d in sel_dom}
+                        pool_pairs = [
+                            (e, p)
+                            for e, p in pool_pairs
+                            if e.split("@", 1)[-1].lower() in want_dom
+                        ]
+                elif mode == "By email address(es)":
+                    sel_em = list(st.session_state.get("inbox_sel_emails") or [])
+                    extra_raw = (st.session_state.get("inbox_extra_emails") or "").strip()
+                    for line in extra_raw.splitlines():
+                        line = line.strip()
+                        if line and "@" in line:
+                            sel_em.append(line)
+                    want_em = {e.strip().lower() for e in sel_em if e.strip()}
+                    if not want_em:
+                        st.error(
+                            "Select or paste at least one sender email, or switch to “All senders”."
+                        )
+                        fetch_aborted = True
+                    else:
+                        pool_pairs = [
+                            (e, p)
+                            for e, p in pool_pairs
+                            if e.strip().lower() in want_em
+                        ]
+
                 out_path = (inbox_out_csv or "").strip() or INBOX_CSV
-                if not pool_pairs:
-                    st.error("No accounts to fetch (check SENDER_POOL or domain filter).")
+                if fetch_aborted:
+                    pass
+                elif not pool_pairs:
+                    if mode == "All senders in SENDER_POOL":
+                        st.error("SENDER_POOL has no accounts with passwords — cannot fetch.")
+                    else:
+                        st.error(
+                            "No matching accounts in SENDER_POOL for this selection "
+                            "(check spelling and passwords)."
+                        )
                 else:
                     if inbox_fresh or not os.path.isfile(out_path):
                         with open(out_path, "w", newline="", encoding="utf-8") as _f:
