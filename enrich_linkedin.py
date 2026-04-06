@@ -49,6 +49,12 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--workers", "-w", type=int, default=3,              help="Parallel API calls (default: 3)")
     p.add_argument("--fresh",   action="store_true",                    help="Re-enrich all rows, even those with existing notes")
     p.add_argument("--delay",   type=float, default=0.5,                help="Seconds between API calls per worker (default: 0.5)")
+    p.add_argument(
+        "--checkpoint-every",
+        type=int,
+        default=25,
+        help="Persist output every N completed rows (default: 25, 0 = end only)",
+    )
     return p.parse_args()
 
 
@@ -120,16 +126,19 @@ def _fetch_by_url(linkedin_url: str) -> dict | None:
         "include_profile_status":     "false",
         "include_company_public_url": "false",
     })
+    if profile is None:
+        profile = {}
 
-    # Fetch latest post separately — returns a list of posts under "data"
+    # Speed path: if enrich-lead already yields a usable signal
+    # (about/headline/skills/publications/awards), avoid a second API call.
+    if _extract_research_note(profile):
+        return profile
+
+    # Otherwise fetch latest post separately — returns a list of posts under "data"
     post_data = _api_get("get-profile-posts", {
         "linkedin_url": linkedin_url,
         "type":         "posts",
     })
-
-    # Merge: inject most recent post into profile dict
-    if profile is None:
-        profile = {}
     if post_data:
         first_post = post_data[0] if isinstance(post_data, list) else post_data
         if isinstance(first_post, dict) and first_post.get("text"):
@@ -287,27 +296,39 @@ def enrich_row(row: dict, delay: float = 0.5) -> dict:
 
     li_url  = _find_linkedin_url(row)
     profile = None
+    did_lookup = False
 
     # Tier 1 — direct URL
     if li_url:
+        did_lookup = True
         profile = _fetch_by_url(li_url)
 
     # Tier 2 — RapidAPI name+company search
     if profile is None and (first or last):
+        did_lookup = True
         profile = _search_by_name_company(first, last, company)
 
     # Tier 3 — Google to discover the URL, then fetch profile
     if profile is None:
         discovered_url = _google_find_linkedin_url(first, last, company, email)
         if discovered_url:
+            did_lookup = True
             profile = _fetch_by_url(discovered_url)
 
     note = _extract_research_note(profile) if profile else ""
-    time.sleep(delay)
+    if did_lookup and delay > 0:
+        time.sleep(delay)
 
     enriched = dict(row)
     enriched["research_note"] = note
     return enriched
+
+
+def _write_output(path: str, fieldnames: list[str], rows: list[dict]) -> None:
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
+        writer.writeheader()
+        writer.writerows(rows)
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
@@ -343,9 +364,11 @@ def main() -> None:
 
     if not pending_idx:
         print("Nothing to enrich. Pass --fresh to re-enrich all rows.")
+        _write_output(args.output, fieldnames, rows)
     else:
         done_n = [0]
         lock   = threading.Lock()
+        checkpoint_every = max(0, args.checkpoint_every)
 
         def _work(i: int) -> tuple[int, dict]:
             enriched = enrich_row(rows[i], delay=args.delay)
@@ -365,11 +388,11 @@ def main() -> None:
                             f"[{done_n[0]:>4}/{len(pending_idx)}]  {name:<30}  "
                             + (f'"{note_short}..."' if note_short else "(no note found)")
                         )
+                    if checkpoint_every > 0 and done_n[0] % checkpoint_every == 0:
+                        _write_output(args.output, fieldnames, rows)
+                        print(f"  ↳ checkpoint saved ({done_n[0]}/{len(pending_idx)}) → {args.output}")
 
-    with open(args.output, "w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=fieldnames, extrasaction="ignore")
-        writer.writeheader()
-        writer.writerows(rows)
+    _write_output(args.output, fieldnames, rows)
 
     enriched_count = sum(1 for r in rows if r.get("research_note", "").strip())
     print(f"\nEnriched rows with notes: {enriched_count}/{len(rows)}")

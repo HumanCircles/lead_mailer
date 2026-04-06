@@ -254,32 +254,26 @@ def _process_inbox_rows(
     return out
 
 
-def main() -> None:
-    args = _parse_args()
-    rows = read_inbox_csv(args.input)
+def fetch_full_rows(
+    rows: list[dict[str, str]],
+    accounts: list[tuple[str, str]],
+    workers: int,
+) -> list[dict[str, str]]:
+    """
+    Re-fetch full IMAP bodies for each row (same logic as CLI main).
+
+    `accounts` is (email, password) pairs from SENDER_POOL or roster CSVs.
+    """
     if not rows:
-        print(f"No rows in {args.input}")
-        sys.exit(1)
-
-    if args.csv:
-        accounts = _load_accounts_from_csvs(list(args.csv))
-        if not accounts:
-            print("ERROR: no accounts from --csv")
-            sys.exit(1)
-        print(f"Loaded {len(accounts)} credential(s) from {len(args.csv)} CSV file(s)")
-    else:
-        accounts = _load_sender_pool()
-
+        return []
     pwd_map = _password_map_from_accounts(accounts)
 
     by_inbox: dict[str, list[tuple[int, dict[str, str]]]] = defaultdict(list)
     for i, row in enumerate(rows):
         by_inbox[row["inbox"].strip().lower()].append((i, row))
 
-    print(f"\nFetching full bodies for {len(rows)} row(s) across {len(by_inbox)} inbox(es)\n")
-
     merged: dict[int, dict[str, str]] = {i: dict(rows[i]) for i in range(len(rows))}
-    with ThreadPoolExecutor(max_workers=max(1, args.workers)) as pool:
+    with ThreadPoolExecutor(max_workers=max(1, workers)) as pool:
         futs = {}
         for inbox_key, indexed in by_inbox.items():
             canon_inbox = indexed[0][1]["inbox"].strip()
@@ -301,7 +295,28 @@ def main() -> None:
                 merged[idx] = r
             print(f"[{done:>3}/{len(futs)}]  {inbox}  ({len(chunks)} message(s))", flush=True)
 
-    ordered = [merged[i] for i in range(len(rows))]
+    return [merged[i] for i in range(len(rows))]
+
+
+def main() -> None:
+    args = _parse_args()
+    rows = read_inbox_csv(args.input)
+    if not rows:
+        print(f"No rows in {args.input}")
+        sys.exit(1)
+
+    if args.csv:
+        accounts = _load_accounts_from_csvs(list(args.csv))
+        if not accounts:
+            print("ERROR: no accounts from --csv")
+            sys.exit(1)
+        print(f"Loaded {len(accounts)} credential(s) from {len(args.csv)} CSV file(s)")
+    else:
+        accounts = _load_sender_pool()
+
+    print(f"\nFetching full bodies for {len(rows)} row(s)\n")
+
+    ordered = fetch_full_rows(rows, accounts, args.workers)
 
     with open(args.output, "w", newline="", encoding="utf-8") as f:
         w = csv.DictWriter(f, fieldnames=FIELDNAMES, quoting=csv.QUOTE_MINIMAL)

@@ -34,6 +34,28 @@ except Exception:
     _fetch_inbox_fn = None  # type: ignore[assignment]
     _FETCH_INBOX_AVAILABLE = False
 
+try:
+    from clean_inboxes import FIELDNAMES as _INBOX_CLEAN_FIELDS
+    from clean_inboxes import is_junk as _inbox_is_junk
+    from clean_inboxes import read_inbox_csv as read_inbox_csv_raw
+    _CLEAN_INBOX_AVAILABLE = True
+except Exception:
+    _CLEAN_INBOX_AVAILABLE = False
+    read_inbox_csv_raw = None  # type: ignore[assignment]
+    _INBOX_CLEAN_FIELDS = INBOX_FIELDS  # fallback if import fails elsewhere
+
+try:
+    from fetch_full_real_replies import fetch_full_rows
+    _FETCH_FULL_AVAILABLE = True
+except Exception:
+    _FETCH_FULL_AVAILABLE = False
+
+try:
+    from fetch_inboxes import _load_accounts_from_csvs
+    _ROSTER_LOAD_AVAILABLE = True
+except Exception:
+    _ROSTER_LOAD_AVAILABLE = False
+
 # ── Page config ───────────────────────────────────────────────────────────────
 
 st.set_page_config(
@@ -87,6 +109,10 @@ _DEFAULTS: dict = {
     "inbox_rows":        [],
     "inbox_stop_event":  None,
     "inbox_acct_log":    [],
+    "inbox_clean_running": False,
+    "inbox_full_running":  False,
+    "inbox_clean_status":  "",
+    "inbox_full_status":   "",
 }
 for _k, _v in _DEFAULTS.items():
     if _k not in st.session_state:
@@ -243,10 +269,14 @@ def _load_pool_with_passwords() -> list[tuple[str, str]]:
 
 
 def _load_inbox_csv() -> pd.DataFrame:
-    if not os.path.isfile(INBOX_CSV):
+    return _load_inbox_csv_path(INBOX_CSV)
+
+
+def _load_inbox_csv_path(path: str) -> pd.DataFrame:
+    if not path or not os.path.isfile(path):
         return pd.DataFrame(columns=INBOX_FIELDS)
     try:
-        return pd.read_csv(INBOX_CSV, dtype=str, keep_default_na=False)
+        return pd.read_csv(path, dtype=str, keep_default_na=False)
     except Exception:
         return pd.DataFrame(columns=INBOX_FIELDS)
 
@@ -997,35 +1027,63 @@ with tab_batch:
 
 with tab_inbox:
     st.markdown("# Inbox")
-    st.caption("Fetch replies from all sender inboxes via IMAP.")
+    st.caption(
+        "IMAP fetch (snippet bodies), optional domain filter, then clean bounces, "
+        "then full-body re-fetch — mirrors `fetch_inboxes.py`, `clean_inboxes.py`, "
+        "`fetch_full_real_replies.py`."
+    )
 
+    # ── 1) IMAP fetch ─────────────────────────────────────────────────────────
     if not _FETCH_INBOX_AVAILABLE:
         st.warning(
-            "`fetch_inboxes` module could not be imported. "
-            "Make sure `fetch_inboxes.py` exists and its dependencies are installed."
+            "`fetch_inboxes` could not be imported — IMAP fetch is disabled. "
+            "`clean_inboxes` / full-body steps still work if those modules load."
         )
     else:
-        # ── Date range & options ──────────────────────────────────────────────
-        _today_date   = datetime.now(tz=IST).date()
+        _today_date = datetime.now(tz=IST).date()
         _default_since = _today_date - timedelta(days=7)
 
         dcol1, dcol2, dcol3 = st.columns([2, 2, 2])
         with dcol1:
             since_date = st.date_input("Since", value=_default_since, key="inbox_since")
         with dcol2:
-            until_date = st.date_input("Until", value=_today_date,   key="inbox_until")
+            until_date = st.date_input("Until", value=_today_date, key="inbox_until")
         with dcol3:
-            inbox_workers = st.slider("Workers", min_value=10, max_value=50,
-                                      value=30, step=5, key="inbox_workers")
+            inbox_workers = st.slider(
+                "Workers", min_value=5, max_value=50, value=30, step=5, key="inbox_workers"
+            )
 
-        since_dt = datetime(since_date.year, since_date.month, since_date.day,
-                            tzinfo=timezone.utc)
-        until_dt = datetime(until_date.year, until_date.month, until_date.day,
-                            23, 59, 59, tzinfo=timezone.utc)
+        ocol1, ocol2, ocol3 = st.columns([2, 2, 2])
+        with ocol1:
+            inbox_out_csv = st.text_input(
+                "Output CSV",
+                value=INBOX_CSV,
+                help="Where to append (or overwrite) fetched rows.",
+                key="inbox_output_csv",
+            )
+        with ocol2:
+            inbox_domain_only = st.text_input(
+                "Only domain (optional)",
+                placeholder="the-easygrowth.us",
+                help="Leave empty to use every address in SENDER_POOL.",
+                key="inbox_domain_only",
+            )
+        with ocol3:
+            inbox_fresh = st.checkbox(
+                "Overwrite output (fresh)",
+                help="Delete existing output and write a new header before fetching.",
+                key="inbox_fresh",
+            )
 
-        # ── Start / Stop ──────────────────────────────────────────────────────
+        since_dt = datetime(
+            since_date.year, since_date.month, since_date.day, tzinfo=timezone.utc
+        )
+        until_dt = datetime(
+            until_date.year, until_date.month, until_date.day,
+            23, 59, 59, tzinfo=timezone.utc,
+        )
+
         ib_col1, ib_col2 = st.columns([2, 1])
-
         with ib_col1:
             ib_start_disabled = st.session_state.inbox_running
             if st.button(
@@ -1036,16 +1094,26 @@ with tab_inbox:
                 key="inbox_start",
             ):
                 pool_pairs = _load_pool_with_passwords()
+                dom = (inbox_domain_only or "").strip().lower()
+                if dom:
+                    pool_pairs = [
+                        (e, p) for e, p in pool_pairs
+                        if e.split("@", 1)[-1].lower() == dom
+                    ]
+                out_path = (inbox_out_csv or "").strip() or INBOX_CSV
                 if not pool_pairs:
-                    st.error("SENDER_POOL is not configured — cannot fetch inboxes.")
+                    st.error("No accounts to fetch (check SENDER_POOL or domain filter).")
                 else:
+                    if inbox_fresh or not os.path.isfile(out_path):
+                        with open(out_path, "w", newline="", encoding="utf-8") as _f:
+                            csv.DictWriter(_f, fieldnames=INBOX_FIELDS).writeheader()
                     stop_ev_ib = threading.Event()
                     st.session_state.inbox_stop_event = stop_ev_ib
-                    st.session_state.inbox_running    = True
-                    st.session_state.inbox_done       = 0
-                    st.session_state.inbox_total      = len(pool_pairs)
-                    st.session_state.inbox_rows       = []
-                    st.session_state.inbox_acct_log   = []
+                    st.session_state.inbox_running = True
+                    st.session_state.inbox_done = 0
+                    st.session_state.inbox_total = len(pool_pairs)
+                    st.session_state.inbox_rows = []
+                    st.session_state.inbox_acct_log = []
 
                     _inbox_lock = threading.Lock()
 
@@ -1055,17 +1123,9 @@ with tab_inbox:
                         _until: datetime,
                         _workers: int,
                         _stop: threading.Event,
+                        _csv_path: str,
                     ) -> None:
-                        # Determine already-fetched inboxes if file exists (fresh run = cleared above)
-                        _done_accounts: set[str] = set()
-
                         csv_write_lock = threading.Lock()
-
-                        # Ensure CSV header exists
-                        with csv_write_lock:
-                            if not os.path.isfile(INBOX_CSV):
-                                with open(INBOX_CSV, "w", newline="", encoding="utf-8") as _f:
-                                    csv.DictWriter(_f, fieldnames=INBOX_FIELDS).writeheader()
 
                         def _fetch_one(email: str, pwd: str) -> tuple[str, list[dict]]:
                             if _stop.is_set():
@@ -1080,52 +1140,53 @@ with tab_inbox:
                             futures = {
                                 executor.submit(_fetch_one, email, pwd): email
                                 for email, pwd in _pairs
-                                if email not in _done_accounts
                             }
                             for fut in as_completed(futures):
                                 if _stop.is_set():
                                     break
                                 acct_email, msgs = fut.result()
                                 count = len(msgs)
-
                                 with _inbox_lock:
                                     st.session_state.inbox_rows.extend(msgs)
                                     st.session_state.inbox_done += 1
                                     st.session_state.inbox_acct_log.append(
                                         {"account": acct_email, "messages": count}
                                     )
-
                                 if msgs:
                                     with csv_write_lock:
                                         try:
-                                            with open(INBOX_CSV, "a", newline="", encoding="utf-8") as _f:
+                                            with open(
+                                                _csv_path, "a", newline="", encoding="utf-8"
+                                            ) as _f:
                                                 w = csv.DictWriter(
-                                                    _f, fieldnames=INBOX_FIELDS,
+                                                    _f,
+                                                    fieldnames=INBOX_FIELDS,
                                                     extrasaction="ignore",
                                                 )
                                                 w.writerows(msgs)
                                         except Exception:
                                             pass
-
                         st.session_state.inbox_running = False
 
                     t_ib = threading.Thread(
                         target=_run_inbox_fetch,
-                        args=(pool_pairs, since_dt, until_dt, inbox_workers,
-                              stop_ev_ib),
+                        args=(pool_pairs, since_dt, until_dt, inbox_workers, stop_ev_ib, out_path),
                         daemon=True,
                     )
                     t_ib.start()
                     st.rerun()
 
         with ib_col2:
-            if st.button("⏹ Stop", disabled=not st.session_state.inbox_running,
-                         use_container_width=True, key="inbox_stop"):
+            if st.button(
+                "⏹ Stop",
+                disabled=not st.session_state.inbox_running,
+                use_container_width=True,
+                key="inbox_stop",
+            ):
                 if st.session_state.inbox_stop_event:
                     st.session_state.inbox_stop_event.set()
 
-        # ── Progress bar ──────────────────────────────────────────────────────
-        ib_done  = st.session_state.inbox_done
+        ib_done = st.session_state.inbox_done
         ib_total = st.session_state.inbox_total
         if ib_total > 0:
             st.progress(
@@ -1133,7 +1194,6 @@ with tab_inbox:
                 text=f"{ib_done}/{ib_total} accounts processed",
             )
 
-        # ── Live account log ──────────────────────────────────────────────────
         ib_acct_log = st.session_state.inbox_acct_log
         if ib_acct_log:
             st.markdown(f"**Accounts processed** ({len(ib_acct_log)} so far)")
@@ -1143,20 +1203,20 @@ with tab_inbox:
                 use_container_width=True,
             )
 
-        # ── Results table (after completion) ──────────────────────────────────
         inbox_rows = st.session_state.inbox_rows
         if inbox_rows and not st.session_state.inbox_running:
             st.divider()
-            st.markdown(f"**Fetched {len(inbox_rows)} messages**")
-
+            st.markdown(f"**Fetched {len(inbox_rows)} messages** (session)")
             inbox_result_df = pd.DataFrame(inbox_rows)
-
-            # Filters
             fc1, fc2 = st.columns(2)
             with fc1:
                 if "inbox" in inbox_result_df.columns:
                     _ib_domains = sorted(
-                        set(e.split("@")[-1] for e in inbox_result_df["inbox"].dropna() if "@" in e)
+                        set(
+                            e.split("@")[-1]
+                            for e in inbox_result_df["inbox"].dropna()
+                            if "@" in e
+                        )
                     )
                     ib_domain_filter = st.selectbox(
                         "Filter by inbox domain",
@@ -1182,7 +1242,6 @@ with tab_inbox:
                 filtered_ib = filtered_ib[mask]
 
             st.dataframe(filtered_ib, hide_index=True, use_container_width=True)
-
             st.download_button(
                 "Download CSV",
                 data=filtered_ib.to_csv(index=False).encode(),
@@ -1193,25 +1252,174 @@ with tab_inbox:
         elif not inbox_rows and not st.session_state.inbox_running and ib_total > 0:
             st.info("No messages found in the selected date range.")
 
-        # ── Also show existing inbox_replies.csv if no session data ──────────
-        if not inbox_rows and not st.session_state.inbox_running and ib_total == 0:
-            existing_inbox = _load_inbox_csv()
+        _preview_path = (inbox_out_csv or "").strip() or INBOX_CSV
+        if (
+            not inbox_rows
+            and not st.session_state.inbox_running
+            and ib_total == 0
+        ):
+            existing_inbox = _load_inbox_csv_path(_preview_path)
             if not existing_inbox.empty:
                 st.divider()
-                st.markdown(f"**Existing inbox_replies.csv** — {len(existing_inbox)} rows")
+                st.markdown(f"**Existing file** — `{_preview_path}` ({len(existing_inbox)} rows)")
                 st.dataframe(existing_inbox, hide_index=True, use_container_width=True)
                 st.download_button(
                     "Download existing CSV",
                     data=existing_inbox.to_csv(index=False).encode(),
-                    file_name="inbox_replies.csv",
+                    file_name=os.path.basename(_preview_path),
                     mime="text/csv",
                     key="inbox_dl_existing",
                 )
 
-        # Auto-rerun while running
-        if st.session_state.inbox_running:
-            time.sleep(0.8)
+    # ── 2) Clean (remove bounces / OOO) ───────────────────────────────────────
+    st.divider()
+    st.markdown("### Clean inbox export")
+    st.caption("Same as `python clean_inboxes.py` — drops bounces, auto-replies, and system mail.")
+
+    if not _CLEAN_INBOX_AVAILABLE or read_inbox_csv_raw is None:
+        st.warning("`clean_inboxes` could not be imported.")
+    else:
+        c1, c2, c3 = st.columns([2, 2, 1])
+        with c1:
+            clean_in_path = st.text_input(
+                "Input CSV",
+                value=INBOX_CSV,
+                key="clean_in_path",
+            )
+        with c2:
+            clean_out_path = st.text_input(
+                "Output CSV",
+                value="real_replies.csv",
+                key="clean_out_path",
+            )
+        with c3:
+            clean_go = st.button(
+                "Run clean",
+                disabled=st.session_state.inbox_clean_running,
+                use_container_width=True,
+                key="clean_run",
+            )
+
+        if st.session_state.inbox_clean_status:
+            st.success(st.session_state.inbox_clean_status)
+
+        if clean_go:
+            st.session_state.inbox_clean_running = True
+            st.session_state.inbox_clean_status = ""
+
+            def _run_clean() -> None:
+                try:
+                    rows = read_inbox_csv_raw(clean_in_path)
+                    total = len(rows)
+                    kept = [r for r in rows if not _inbox_is_junk(r)]
+                    with open(clean_out_path, "w", newline="", encoding="utf-8") as f:
+                        w = csv.DictWriter(f, fieldnames=_INBOX_CLEAN_FIELDS)
+                        w.writeheader()
+                        w.writerows(kept)
+                    st.session_state.inbox_clean_status = (
+                        f"Saved {len(kept)} real replies (removed {total - len(kept)} junk) → {clean_out_path}"
+                    )
+                except Exception as e:
+                    st.session_state.inbox_clean_status = f"Error: {e}"
+                finally:
+                    st.session_state.inbox_clean_running = False
+
+            threading.Thread(target=_run_clean, daemon=True).start()
             st.rerun()
+
+    # ── 3) Full bodies (IMAP RFC822) ──────────────────────────────────────────
+    st.divider()
+    st.markdown("### Full message bodies")
+    st.caption(
+        "Same as `fetch_full_real_replies.py` — re-downloads full bodies for each cleaned row."
+    )
+
+    if not _FETCH_FULL_AVAILABLE:
+        st.warning("`fetch_full_real_replies` could not be imported.")
+    else:
+        f1, f2, f3 = st.columns([2, 2, 2])
+        with f1:
+            full_in_path = st.text_input(
+                "Input CSV (cleaned)",
+                value="real_replies.csv",
+                key="full_in_path",
+            )
+        with f2:
+            full_out_path = st.text_input(
+                "Output CSV",
+                value="full_real_replies.csv",
+                key="full_out_path",
+            )
+        with f3:
+            full_workers = st.slider(
+                "Workers", min_value=1, max_value=24, value=12, key="full_workers"
+            )
+        roster_opt = ""
+        if _ROSTER_LOAD_AVAILABLE:
+            roster_opt = st.text_input(
+                "Credentials CSV (optional)",
+                placeholder="Leave empty to use SENDER_POOL from .env",
+                key="full_roster_csv",
+            )
+
+        if st.session_state.inbox_full_status:
+            st.info(st.session_state.inbox_full_status)
+
+        full_go = st.button(
+            "Fetch full bodies",
+            disabled=st.session_state.inbox_full_running,
+            use_container_width=True,
+            key="full_run",
+        )
+
+        if full_go:
+            st.session_state.inbox_full_running = True
+            st.session_state.inbox_full_status = ""
+
+            def _run_full() -> None:
+                try:
+                    if read_inbox_csv_raw is None:
+                        raise RuntimeError("clean_inboxes reader not available")
+                    rows = read_inbox_csv_raw(full_in_path)
+                    if not rows:
+                        st.session_state.inbox_full_status = "No rows in input file."
+                        st.session_state.inbox_full_running = False
+                        return
+                    if roster_opt and roster_opt.strip() and _ROSTER_LOAD_AVAILABLE:
+                        accounts = _load_accounts_from_csvs([roster_opt.strip()])
+                    else:
+                        accounts = _load_pool_with_passwords()
+                    if not accounts:
+                        st.session_state.inbox_full_status = "No credentials (SENDER_POOL or roster CSV)."
+                        st.session_state.inbox_full_running = False
+                        return
+                    ordered = fetch_full_rows(rows, accounts, full_workers)
+                    with open(full_out_path, "w", newline="", encoding="utf-8") as f:
+                        w = csv.DictWriter(
+                            f, fieldnames=_INBOX_CLEAN_FIELDS, quoting=csv.QUOTE_MINIMAL
+                        )
+                        w.writeheader()
+                        w.writerows(ordered)
+                    long_n = sum(1 for r in ordered if len((r.get("body") or "").strip()) > 500)
+                    st.session_state.inbox_full_status = (
+                        f"Wrote {len(ordered)} rows → {full_out_path} (~{long_n} long bodies)."
+                    )
+                except Exception as e:
+                    st.session_state.inbox_full_status = f"Error: {e}"
+                finally:
+                    st.session_state.inbox_full_running = False
+
+            threading.Thread(target=_run_full, daemon=True).start()
+            st.rerun()
+
+    # Auto-rerun while a background job is running
+    if (
+        st.session_state.inbox_running
+        or st.session_state.inbox_clean_running
+        or st.session_state.inbox_full_running
+    ):
+        time.sleep(0.8)
+        st.rerun()
 
 
 # ══════════════════════════════════════════════════════════════════════════════
