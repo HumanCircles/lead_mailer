@@ -1,6 +1,7 @@
 import os
 import re
 import json
+import csv
 from openai import OpenAI
 from dotenv import load_dotenv
 
@@ -21,6 +22,36 @@ MODEL   = os.getenv("OPENAI_MODEL", "gpt-4.1-mini")
 _GUIDE_PATH = os.path.join(os.path.dirname(os.path.dirname(__file__)), "MESSAGING_README.md")
 with open(_GUIDE_PATH, encoding="utf-8") as _f:
     MESSAGING_GUIDE = strip_control_chars(_f.read())
+
+_STYLE_PREVIEW_PATH = os.path.join(
+    os.path.dirname(os.path.dirname(__file__)),
+    "dry_run_preview.csv",
+)
+
+
+def _load_style_examples(max_examples: int = 3) -> str:
+    """Build a compact style anchor from dry_run_preview.csv if available."""
+    if not os.path.isfile(_STYLE_PREVIEW_PATH):
+        return ""
+    examples: list[str] = []
+    try:
+        with open(_STYLE_PREVIEW_PATH, newline="", encoding="utf-8") as f:
+            for row in csv.DictReader(f):
+                subject = strip_control_chars(str(row.get("subject", "") or "")).strip()
+                body = strip_control_chars(str(row.get("body", "") or "")).strip()
+                if not subject or not body:
+                    continue
+                examples.append(
+                    f"Subject: {subject}\n"
+                    f"Body:\n{body}"
+                )
+                if len(examples) >= max_examples:
+                    break
+    except Exception:
+        return ""
+    if not examples:
+        return ""
+    return "\n\n".join(examples)
 
 
 def _parse_json(raw: str) -> dict:
@@ -94,17 +125,34 @@ def draft_email(lead_data: dict) -> dict:
         "\n- Research note: none — infer Beat 1 from their title, company, and platform context"
     )
 
+    style_anchor = _load_style_examples(max_examples=3)
+
     prompt = f"""Prospect:
 - Name: {name}
 - Title: {title}
 - Company: {company}
 - Platform: {platform}{research_block}
 
+Target style:
+- Match the same writing tone, pacing, paragraph rhythm, and sentence structure
+  used in dry_run_preview.csv outputs.
+- Keep the body in that exact style family. Do not introduce a new style.
+- Preserve the same 5-beat flow and concise plain-text structure.
+
+Style exemplars (copy the style, not the facts):
+{style_anchor if style_anchor else "(Style exemplars unavailable; follow playbook style exactly.)"}
+
 Write the email following the playbook exactly. Return JSON only — no markdown, no preamble:
 {{
   "subject": "...",
   "body": "..."
-}}"""
+}}
+
+Extra style guard for opening paragraph:
+- Keep paragraph 1 natural and concise (1-2 sentences).
+- Do NOT mirror their full title line in paragraph 1.
+- Do NOT write stiff phrasing like "in your role as..." or "as [title]...".
+""" 
 
     for attempt in range(2):
         resp = _client.chat.completions.create(

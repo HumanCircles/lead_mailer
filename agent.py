@@ -32,6 +32,7 @@ PROSPECTS_FILE = os.getenv("PROSPECTS_FILE", "prospects.csv")
 _LOG_HEADERS = [
     "timestamp", "prospect_email", "prospect_name",
     "company", "subject", "status", "error", "from_email",
+    "message_id", "delivery_status", "delivery_reason",
 ]
 
 _log_lock   = threading.Lock()
@@ -51,16 +52,19 @@ def _migrate_log() -> None:
     with open(SENT_LOG_FILE, encoding="utf-8") as f:
         first = f.readline()
     has_header = "prospect_email" in first or "timestamp" in first
-    if has_header and "from_email" in first:
+    if has_header and "delivery_reason" in first:
         return  # already up to date
     with open(SENT_LOG_FILE, newline="", encoding="utf-8") as f:
         rows = list(csv.reader(f))
     if not rows:
         return
     if has_header:
-        # Has a header but missing from_email — append the column
+        # Has a header but missing one or more expected columns — append them
         header, *body = rows
-        new_header = header + ["from_email"]
+        new_header = list(header)
+        for col in _LOG_HEADERS:
+            if col not in new_header:
+                new_header.append(col)
         padded = [list(r) + [""] * (len(new_header) - len(r)) for r in body]
     else:
         # No header at all — prepend one, data rows already have the right columns
@@ -112,6 +116,11 @@ def _parse_args() -> argparse.Namespace:
                    help="Process at most N prospects (0 = all)")
     p.add_argument("--file", default="", metavar="PATH",
                    help="Prospects CSV (overrides PROSPECTS_FILE env var)")
+    p.add_argument(
+        "--resend",
+        action="store_true",
+        help="Ignore sent_log duplicate check and resend to all rows in the input file",
+    )
     return p.parse_args()
 
 
@@ -128,7 +137,7 @@ def main() -> None:
     _migrate_log()
 
     all_prospects = _load_prospects(prospects_file)
-    already_sent  = _load_sent()
+    already_sent  = set() if args.resend else _load_sent()
 
     pending = [
         p for p in all_prospects
@@ -147,7 +156,8 @@ def main() -> None:
     print(
         f"Loaded {len(all_prospects)} prospects — {total} pending"
         f" — {len(already_sent)} already sent"
-        + (" [DRY RUN]" if args.dry_run else ""),
+        + (" [DRY RUN]" if args.dry_run else "")
+        + (" [RESEND]" if args.resend else ""),
         flush=True,
     )
 

@@ -53,6 +53,9 @@ def _make_log_row(
     status: str,
     error: str = "",
     from_email: str = "",
+    message_id: str = "",
+    delivery_status: str = "",
+    delivery_reason: str = "",
     body: str = "",
 ) -> dict:
     return {
@@ -64,6 +67,9 @@ def _make_log_row(
         "status":         status,
         "error":          error,
         "from_email":     from_email,
+        "message_id":     message_id,
+        "delivery_status": delivery_status,
+        "delivery_reason": delivery_reason,
         "body":           body,   # full formatted body; not written to CSV (extrasaction ignored)
     }
 
@@ -175,8 +181,19 @@ def _send_phase(
 
         with sem:
             try:
-                from_addr, body_sent = send_email(email, subject, body, prospect.get("first_name", ""))
-                row = _make_log_row(prospect, subject, "pushed", from_email=from_addr, body=body_sent)
+                from_addr, body_sent, message_id = send_email(
+                    email, subject, body, prospect.get("first_name", "")
+                )
+                row = _make_log_row(
+                    prospect,
+                    subject,
+                    "pushed",
+                    from_email=from_addr,
+                    message_id=message_id,
+                    delivery_status="accepted",
+                    delivery_reason="",
+                    body=body_sent,
+                )
             except Exception as e:
                 if is_siteground_hourly_lockout(e):
                     log.warning("SiteGround 550 lockout hit — putting draft back in queue")

@@ -233,12 +233,33 @@ def _ensure_recipient_greeting(body: str, recipient_first_name: str) -> str:
     return f"Hi {first},\n\n{text}" if first else text
 
 
+def _extract_message_id(headers) -> str:
+    """Extract SendGrid message ID from response headers."""
+    if not headers:
+        return ""
+    for key in ("X-Message-Id", "x-message-id", "X-Message-ID"):
+        try:
+            if hasattr(headers, "get"):
+                val = headers.get(key)
+                if val:
+                    return str(val).strip()
+        except Exception:
+            pass
+    try:
+        for k, v in headers.items():
+            if str(k).lower() == "x-message-id" and v:
+                return str(v).strip()
+    except Exception:
+        pass
+    return ""
+
+
 def _sendgrid_deliver(
     sender_email: str,
     to_email: str,
     subject: str,
     body: str,
-) -> None:
+) -> str:
     """Build and dispatch a SendGrid Mail object."""
     domain = sender_email.split("@", 1)[1] if "@" in sender_email else ""
     sg_client, pool_name = _sg_for_domain(domain)
@@ -269,14 +290,15 @@ def _sendgrid_deliver(
     response = sg_client.send(message)
     if response.status_code not in (200, 201, 202):
         raise RuntimeError(f"SendGrid API error {response.status_code}: {response.body}")
+    return _extract_message_id(getattr(response, "headers", None))
 
 
 def send_email(
     to_email: str, subject: str, body: str, recipient_first_name: str = ""
-) -> tuple[str, str]:
+) -> tuple[str, str, str]:
     """Send one email via SendGrid.
 
-    Returns (sender_address, formatted_body) — the exact body that was delivered,
+    Returns (sender_address, formatted_body, message_id) — the exact body that was delivered,
     including greeting, signature, and unsubscribe footer.
     Raises on unrecoverable failure.
     """
@@ -289,7 +311,7 @@ def send_email(
     body_with_sig = append_signature_block(body_out, sender_email=sender)
     body_final    = append_unsubscribe_footer(body_with_sig)
 
-    _sendgrid_deliver(sender, to_email, subject, body_final)
+    message_id = _sendgrid_deliver(sender, to_email, subject, body_final)
 
     with _pool_lock:
         _sender_state[sender]["daily"] += 1
@@ -297,8 +319,8 @@ def send_email(
     if SEND_DELAY_SECONDS > 0:
         time.sleep(SEND_DELAY_SECONDS)
 
-    log.info("pushed to=%s from=%s via=sendgrid", to_email, sender)
-    return sender, body_final
+    log.info("pushed to=%s from=%s via=sendgrid message_id=%s", to_email, sender, message_id or "-")
+    return sender, body_final, message_id
 
 
 # ── Admin seed email ───────────────────────────────────────────────────────

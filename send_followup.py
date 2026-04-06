@@ -31,7 +31,8 @@ load_dotenv()
 
 SENT_LOG_FILE = os.getenv("SENT_LOG_FILE", "sent_log.csv")
 _LOG_HEADERS  = ["timestamp", "prospect_email", "prospect_name", "company",
-                 "subject", "status", "error", "from_email"]
+                 "subject", "status", "error", "from_email",
+                 "message_id", "delivery_status", "delivery_reason"]
 
 # ── Follow-up drafter ─────────────────────────────────────────────────────────
 
@@ -123,6 +124,34 @@ def _load_suppression() -> set[str]:
     return set()  # is_suppressed() called per-row below
 
 
+def _ensure_sent_log_schema(path: str) -> None:
+    if not os.path.isfile(path):
+        return
+    with open(path, encoding="utf-8") as f:
+        first = f.readline()
+    has_header = "prospect_email" in first or "timestamp" in first
+    if has_header and "delivery_reason" in first:
+        return
+    with open(path, newline="", encoding="utf-8") as f:
+        rows = list(csv.reader(f))
+    if not rows:
+        return
+    if has_header:
+        header, *body = rows
+        new_header = list(header)
+        for col in _LOG_HEADERS:
+            if col not in new_header:
+                new_header.append(col)
+        padded = [list(r) + [""] * (len(new_header) - len(r)) for r in body]
+    else:
+        new_header = list(_LOG_HEADERS)
+        padded = [list(r) + [""] * (len(new_header) - len(r)) for r in rows]
+    with open(path, "w", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        w.writerow(new_header)
+        w.writerows(padded)
+
+
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def main() -> None:
@@ -137,6 +166,7 @@ def main() -> None:
         print(f"No sent log found at {SENT_LOG_FILE}")
         sys.exit(0)
 
+    _ensure_sent_log_schema(SENT_LOG_FILE)
     with open(SENT_LOG_FILE, newline="", encoding="utf-8") as f:
         all_rows = list(csv.DictReader(f))
 
@@ -211,7 +241,7 @@ def main() -> None:
             if not body:
                 raise ValueError("Empty follow-up body generated")
             subject = f"Re: {orig_subject}"
-            from_addr, _ = send_email(email, subject, body, first_name)
+            from_addr, _body_sent, message_id = send_email(email, subject, body, first_name)
             return {
                 "timestamp":      datetime.now(timezone.utc).isoformat(),
                 "prospect_email": email,
@@ -221,6 +251,9 @@ def main() -> None:
                 "status":         "followup_pushed",
                 "error":          "",
                 "from_email":     from_addr,
+                "message_id":     message_id,
+                "delivery_status": "accepted",
+                "delivery_reason": "",
             }
         except Exception as e:
             return {
@@ -232,6 +265,9 @@ def main() -> None:
                 "status":         "followup_failed",
                 "error":          str(e),
                 "from_email":     "",
+                "message_id":     "",
+                "delivery_status": "",
+                "delivery_reason": "",
             }
 
     done_n = [0]

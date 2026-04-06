@@ -33,6 +33,12 @@ Open with something you genuinely saw, read, or noticed about the recipient. A p
 
 The observation must be real and specific. A generic opener ("I've been following your work") is worse than no opener at all.
 
+Additional quality rules for Beat 1:
+- Do not restate the recipient's job title verbatim in the opening line.
+- Avoid stiff role labels like "as [full title]" or "in your role as [title]".
+- Keep the first paragraph to 1-2 concise sentences that read conversationally.
+- Use one concrete observation plus one implication. Avoid long setup clauses.
+
 ### Beat 2 — The Insider Gap (2-3 sentences)
 Move from the observation into the specific problem their company or platform has. Name the product line, the segment, the failure mode. Use insider language: the term they use internally, not the term a vendor would use. This should make them pause and think "how do they know that?"
 

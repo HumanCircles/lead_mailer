@@ -62,6 +62,7 @@ DRY_RUN_PREVIEW_FILE = "dry_run_preview.csv"
 _LOG_HEADERS = [
     "timestamp", "prospect_email", "prospect_name",
     "company", "subject", "status", "error", "from_email",
+    "message_id", "delivery_status", "delivery_reason",
 ]
 
 # ── Session defaults ──────────────────────────────────────────────────────────
@@ -78,6 +79,7 @@ _DEFAULTS: dict = {
     "batch_done":        0,
     "batch_total":       0,
     "batch_stop_event":  None,
+    "batch_shared":      None,
     # inbox tab
     "inbox_running":     False,
     "inbox_done":        0,
@@ -89,6 +91,38 @@ _DEFAULTS: dict = {
 for _k, _v in _DEFAULTS.items():
     if _k not in st.session_state:
         st.session_state[_k] = _v
+
+
+def _ensure_sent_log_schema() -> None:
+    """Add any missing sent_log columns in-place, preserving existing rows."""
+    if not os.path.isfile(SENT_LOG_FILE):
+        return
+    with open(SENT_LOG_FILE, encoding="utf-8") as f:
+        first = f.readline()
+    has_header = "prospect_email" in first or "timestamp" in first
+    if has_header and "delivery_reason" in first:
+        return
+    with open(SENT_LOG_FILE, newline="", encoding="utf-8") as f:
+        rows = list(csv.reader(f))
+    if not rows:
+        return
+    if has_header:
+        header, *body = rows
+        new_header = list(header)
+        for col in _LOG_HEADERS:
+            if col not in new_header:
+                new_header.append(col)
+        padded = [list(r) + [""] * (len(new_header) - len(r)) for r in body]
+    else:
+        new_header = list(_LOG_HEADERS)
+        padded = [list(r) + [""] * (len(new_header) - len(r)) for r in rows]
+    with open(SENT_LOG_FILE, "w", newline="", encoding="utf-8") as f:
+        w = csv.writer(f)
+        w.writerow(new_header)
+        w.writerows(padded)
+
+
+_ensure_sent_log_schema()
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -335,7 +369,8 @@ with tab_dash:
     st.markdown("**Recent sends** (last 10)")
     if not log_df_d.empty:
         show_cols_d = [c for c in ["_ts_ist", "prospect_email", "prospect_name",
-                                    "company", "status", "from_email", "subject"]
+                                    "company", "status", "delivery_status",
+                                    "from_email", "subject"]
                        if c in log_df_d.columns]
         recent_d = log_df_d[show_cols_d].iloc[::-1].head(10).reset_index(drop=True)
         st.dataframe(recent_d, hide_index=True, use_container_width=True,
@@ -698,7 +733,7 @@ with tab_outreach:
                         if st.button("Send", type="primary", use_container_width=True, key=f"send_{k}"):
                             with st.spinner("Sending…"):
                                 try:
-                                    from_addr, _ = send_email(
+                                    from_addr, _body_sent, _message_id = send_email(
                                         p["email"], subj, body, p.get("first_name", "")
                                     )
                                     st.session_state.results[k]["status"] = "sent"
@@ -750,6 +785,18 @@ with tab_batch:
         except Exception as e:
             st.error(f"Could not read CSV: {e}")
 
+    # Sync batch snapshot from worker-owned shared state.
+    _bs = st.session_state.get("batch_shared")
+    if _bs is not None:
+        try:
+            with _bs["lock"]:
+                st.session_state.batch_log = list(_bs["log"])
+                st.session_state.batch_done = int(_bs["done"])
+                st.session_state.batch_total = int(_bs["total"])
+                st.session_state.batch_running = bool(_bs["running"])
+        except Exception:
+            pass
+
     batch_prospects = st.session_state.batch_prospects
     if not batch_prospects:
         st.info("Upload a CSV above to start a batch run.")
@@ -770,8 +817,15 @@ with tab_batch:
             if str(p.get("email", "")).strip().lower() not in already_sent_b
         ]
 
-        col_start, col_stop, col_dryrun = st.columns([2, 1, 1])
+        col_start, col_stop, col_dryrun, col_resend = st.columns([2, 1, 1, 1])
         dry_run_b = col_dryrun.checkbox("Dry run (no send)", key="batch_dryrun")
+        force_resend_b = col_resend.checkbox(
+            "Force resend",
+            key="batch_force_resend",
+            help="Ignore sent_log duplicate check and send to every row in this upload.",
+        )
+        if force_resend_b:
+            pending_b = list(batch_prospects)
         preview_file_b = st.text_input(
             "Dry-run preview file",
             value=DRY_RUN_PREVIEW_FILE,
@@ -795,12 +849,23 @@ with tab_batch:
                 st.session_state.batch_log        = []
                 st.session_state.batch_done       = 0
                 st.session_state.batch_total      = len(pending_b)
+                st.session_state.batch_shared     = {
+                    "log": [],
+                    "done": 0,
+                    "total": len(pending_b),
+                    "running": True,
+                    "lock": threading.Lock(),
+                }
 
+                _shared = st.session_state.batch_shared
                 _log_lock_b = threading.Lock()
+                _thread_log_rows: list[dict] = []
 
                 def _on_result_b(row: dict) -> None:
                     with _log_lock_b:
-                        st.session_state.batch_log.append(row)
+                        _thread_log_rows.append(row)
+                    with _shared["lock"]:
+                        _shared["log"].append(row)
                     try:
                         if not os.path.isfile(SENT_LOG_FILE):
                             with open(SENT_LOG_FILE, "w", newline="", encoding="utf-8") as f:
@@ -811,74 +876,79 @@ with tab_batch:
                         pass
 
                 def _on_progress_b(done: int, total: int) -> None:
-                    st.session_state.batch_done  = done
-                    st.session_state.batch_total = total
+                    with _shared["lock"]:
+                        _shared["done"] = done
+                        _shared["total"] = total
 
                 def _run_batch() -> None:
-                    run_pipeline(
-                        prospects=batch_prospects,
-                        already_sent=already_sent_b,
-                        on_result=_on_result_b,
-                        on_progress=_on_progress_b,
-                        stop_event=stop_ev,
-                        dry_run=dry_run_b,
-                    )
-                    st.session_state.batch_running = False
+                    try:
+                        run_pipeline(
+                            prospects=batch_prospects,
+                            already_sent=(set() if force_resend_b else already_sent_b),
+                            on_result=_on_result_b,
+                            on_progress=_on_progress_b,
+                            stop_event=stop_ev,
+                            dry_run=dry_run_b,
+                        )
 
-                    # Seed email summary to admin
-                    log_rows = st.session_state.batch_log
-                    pushed   = sum(1 for r in log_rows if r.get("status") == "pushed")
-                    failed   = sum(1 for r in log_rows if r.get("status") == "failed_api")
-                    dry_cnt  = sum(1 for r in log_rows if r.get("status") == "dry_run")
-                    skip_sup = sum(1 for r in log_rows if r.get("status") == "skipped_suppressed")
-                    skip_dup = sum(1 for r in log_rows if r.get("status") == "skipped_duplicate")
-                    fail_gen = sum(1 for r in log_rows if r.get("status") == "failed_generation")
-                    dry_tag  = " [DRY RUN]" if dry_run_b else ""
-                    ts_label = datetime.now(tz=IST).strftime("%Y-%m-%d %H:%M IST")
+                        # Seed email summary to admin (use thread-local log snapshot)
+                        with _log_lock_b:
+                            log_rows = list(_thread_log_rows)
+                        pushed   = sum(1 for r in log_rows if r.get("status") == "pushed")
+                        failed   = sum(1 for r in log_rows if r.get("status") == "failed_api")
+                        dry_cnt  = sum(1 for r in log_rows if r.get("status") == "dry_run")
+                        skip_sup = sum(1 for r in log_rows if r.get("status") == "skipped_suppressed")
+                        skip_dup = sum(1 for r in log_rows if r.get("status") == "skipped_duplicate")
+                        fail_gen = sum(1 for r in log_rows if r.get("status") == "failed_generation")
+                        dry_tag  = " [DRY RUN]" if dry_run_b else ""
+                        ts_label = datetime.now(tz=IST).strftime("%Y-%m-%d %H:%M IST")
 
-                    preview_saved = 0
-                    preview_path = (preview_file_b or DRY_RUN_PREVIEW_FILE).strip() or DRY_RUN_PREVIEW_FILE
-                    if dry_run_b:
-                        try:
-                            preview_saved = _save_dry_run_preview(log_rows, preview_path)
-                        except Exception:
-                            preview_saved = 0
+                        preview_saved = 0
+                        preview_path = (preview_file_b or DRY_RUN_PREVIEW_FILE).strip() or DRY_RUN_PREVIEW_FILE
+                        if dry_run_b:
+                            try:
+                                preview_saved = _save_dry_run_preview(log_rows, preview_path)
+                            except Exception:
+                                preview_saved = 0
 
-                    sample_emails = [r for r in log_rows if r.get("status") == "pushed"][:2]
-                    summary = (
-                        f"Done — pushed: {pushed}, dry_run: {dry_cnt}, "
-                        f"skipped_suppressed: {skip_sup}, skipped_duplicate: {skip_dup}, "
-                        f"failed_generation: {fail_gen}, failed_api: {failed}"
-                    )
+                        sample_emails = [r for r in log_rows if r.get("status") == "pushed"][:2]
+                        summary = (
+                            f"Done — pushed: {pushed}, dry_run: {dry_cnt}, "
+                            f"skipped_suppressed: {skip_sup}, skipped_duplicate: {skip_dup}, "
+                            f"failed_generation: {fail_gen}, failed_api: {failed}"
+                        )
 
-                    seed_body = (
-                        f"Batch run completed via UI{dry_tag}.\n\n"
-                        f"Prospects loaded: {len(batch_prospects)}\n"
-                        f"Total processed: {len(log_rows)}\n\n"
-                        f"{summary}"
-                    )
-                    if dry_run_b and preview_saved:
-                        seed_body += f"\n\nPreview saved → {preview_path}  ({preview_saved} emails)"
+                        seed_body = (
+                            f"Batch run completed via UI{dry_tag}.\n\n"
+                            f"Prospects loaded: {len(batch_prospects)}\n"
+                            f"Total processed: {len(log_rows)}\n\n"
+                            f"{summary}"
+                        )
+                        if dry_run_b and preview_saved:
+                            seed_body += f"\n\nPreview saved → {preview_path}  ({preview_saved} emails)"
 
-                    if sample_emails:
-                        seed_body += "\n\n" + "=" * 50 + "\n"
-                        seed_body += f"SAMPLE EMAILS SENT ({len(sample_emails)} of {pushed} pushed)\n"
-                        seed_body += "=" * 50
-                        for i, s in enumerate(sample_emails, 1):
-                            seed_body += (
-                                f"\n\n-- Sample {i} --\n"
-                                f"To:      {s.get('prospect_name', '')} <{s.get('prospect_email', '')}>\n"
-                                f"From:    {s.get('from_email', '')}\n"
-                                f"Company: {s.get('company', '')}\n"
-                                f"Subject: {s.get('subject', '')}\n"
-                                f"\n{s.get('body', '(body not captured)')}\n"
-                                f"\n{'-' * 40}"
-                            )
+                        if sample_emails:
+                            seed_body += "\n\n" + "=" * 50 + "\n"
+                            seed_body += f"SAMPLE EMAILS SENT ({len(sample_emails)} of {pushed} pushed)\n"
+                            seed_body += "=" * 50
+                            for i, s in enumerate(sample_emails, 1):
+                                seed_body += (
+                                    f"\n\n-- Sample {i} --\n"
+                                    f"To:      {s.get('prospect_name', '')} <{s.get('prospect_email', '')}>\n"
+                                    f"From:    {s.get('from_email', '')}\n"
+                                    f"Company: {s.get('company', '')}\n"
+                                    f"Subject: {s.get('subject', '')}\n"
+                                    f"\n{s.get('body', '(body not captured)')}\n"
+                                    f"\n{'-' * 40}"
+                                )
 
-                    send_seed_email(
-                        subject=f"[BD Outreach UI] Batch complete{dry_tag} — {ts_label}",
-                        body=seed_body,
-                    )
+                        send_seed_email(
+                            subject=f"[BD Outreach UI] Batch complete{dry_tag} — {ts_label}",
+                            body=seed_body,
+                        )
+                    finally:
+                        with _shared["lock"]:
+                            _shared["running"] = False
 
                 t = threading.Thread(target=_run_batch, daemon=True)
                 t.start()
@@ -889,6 +959,13 @@ with tab_batch:
                          use_container_width=True):
                 if st.session_state.batch_stop_event:
                     st.session_state.batch_stop_event.set()
+                _bs2 = st.session_state.get("batch_shared")
+                if _bs2 is not None:
+                    try:
+                        with _bs2["lock"]:
+                            _bs2["running"] = False
+                    except Exception:
+                        pass
 
         # Progress bar
         done_b    = st.session_state.batch_done
@@ -1215,7 +1292,8 @@ with tab_log:
 
         # Show newest first, use IST timestamp
         show_cols_log = ["timestamp_ist", "prospect_email", "prospect_name",
-                         "company", "status", "from_email", "subject", "error"]
+                         "company", "status", "delivery_status", "delivery_reason",
+                         "from_email", "subject", "error"]
         show_cols_log = [c for c in show_cols_log if c in filtered.columns or c == "timestamp_ist"]
         display_df    = filtered[show_cols_log].iloc[::-1].reset_index(drop=True)
 
